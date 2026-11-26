@@ -10,15 +10,53 @@ include(CTest)
 
 option(METREON_ENABLE_MLIR "Build the Metreon MLIR dialect and GraphIR lowering" OFF)
 option(METREON_TEST_CUDA_EXECUTION "Run integration tests on an actual CUDA GPU" OFF)
+set(METREON_PINNED_LLVM_MAJOR "18" CACHE STRING
+    "Pinned LLVM/MLIR major version for GPU verification and lowering")
+option(METREON_ALLOW_UNPINNED_MLIR
+    "Allow configuring MLIR with an unpinned LLVM/MLIR major version" OFF)
+option(METREON_ENABLE_FORMAL_TOOLS
+    "Discover optional proof-assistant and SMT verification tools" OFF)
 
 if(METREON_TEST_CUDA_EXECUTION AND NOT METREON_ENABLE_MLIR)
     message(FATAL_ERROR "METREON_TEST_CUDA_EXECUTION requires METREON_ENABLE_MLIR=ON")
+endif()
+
+set(METREON_MLIR_ENABLED_BOOL false)
+set(METREON_ALLOW_UNPINNED_MLIR_BOOL false)
+set(METREON_ENABLE_FORMAL_TOOLS_BOOL false)
+set(METREON_CONFIGURED_LLVM_MAJOR "none")
+set(METREON_PROOF_ASSISTANT "")
+set(METREON_SMT_SOLVER "")
+
+if(METREON_ALLOW_UNPINNED_MLIR)
+    set(METREON_ALLOW_UNPINNED_MLIR_BOOL true)
+endif()
+
+if(METREON_ENABLE_FORMAL_TOOLS)
+    set(METREON_ENABLE_FORMAL_TOOLS_BOOL true)
+    find_program(METREON_FOUND_PROOF_ASSISTANT NAMES rocq coqc)
+    find_program(METREON_FOUND_SMT_SOLVER NAMES z3 cvc5)
+    if(METREON_FOUND_PROOF_ASSISTANT)
+        set(METREON_PROOF_ASSISTANT "${METREON_FOUND_PROOF_ASSISTANT}")
+    endif()
+    if(METREON_FOUND_SMT_SOLVER)
+        set(METREON_SMT_SOLVER "${METREON_FOUND_SMT_SOLVER}")
+    endif()
 endif()
 
 if(METREON_ENABLE_MLIR)
     # LLVM's package configuration performs C dependency checks.
     enable_language(C)
     find_package(MLIR REQUIRED CONFIG)
+
+    if(NOT "${LLVM_VERSION_MAJOR}" STREQUAL "${METREON_PINNED_LLVM_MAJOR}"
+       AND NOT METREON_ALLOW_UNPINNED_MLIR)
+        message(FATAL_ERROR
+            "Metreon GPU verification pins LLVM/MLIR ${METREON_PINNED_LLVM_MAJOR}.x, "
+            "found ${LLVM_PACKAGE_VERSION} (pass -DMETREON_ALLOW_UNPINNED_MLIR=ON to override)")
+    endif()
+    set(METREON_MLIR_ENABLED_BOOL true)
+    set(METREON_CONFIGURED_LLVM_MAJOR "${LLVM_VERSION_MAJOR}")
 
     list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}" "${MLIR_CMAKE_DIR}")
     include(TableGen)
@@ -27,6 +65,9 @@ if(METREON_ENABLE_MLIR)
 
     add_subdirectory(dialect)
 endif()
+
+configure_file(cmake/VerificationToolchain.h.in
+    include/metreon/Verification/Toolchain.h @ONLY)
 
 function(metreon_enable_warnings target)
     if(MSVC)
@@ -55,11 +96,13 @@ add_library(metreon_frontend
     lib/Sema/ContextValidator.cpp
     lib/Sema/CallableValidator.cpp
     lib/Sema/CompositionValidator.cpp
+    lib/Verification/GPUProfile.cpp
 )
 
 target_include_directories(metreon_frontend
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_BINARY_DIR}/include
 )
 
 metreon_enable_warnings(metreon_frontend)
@@ -254,6 +297,46 @@ if(BUILD_TESTING)
     add_test(NAME metreon.frontend.accelerator_contexts
         COMMAND metreon_accelerator_context_tests
             ${CMAKE_CURRENT_SOURCE_DIR}/examples/contexts.mtr)
+
+    add_executable(metreon_gpu_verification_profile_tests
+        tests/GPUVerificationProfileTests.cpp)
+    target_link_libraries(metreon_gpu_verification_profile_tests
+        PRIVATE metreon_frontend)
+    metreon_enable_warnings(metreon_gpu_verification_profile_tests)
+    add_test(NAME metreon.gpu.verification.profile
+        COMMAND metreon_gpu_verification_profile_tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/examples/protocols_and_pipelines.mtr
+            ${CMAKE_CURRENT_SOURCE_DIR}/examples/vector_add.mtr
+            ${CMAKE_CURRENT_SOURCE_DIR}/examples/contexts.mtr)
+
+    if(NOT METREON_ENABLE_MLIR)
+        find_program(METREON_STANDALONE_TABLEGEN
+            NAMES llvm-tblgen-${METREON_PINNED_LLVM_MAJOR} llvm-tblgen
+            HINTS /usr/lib/llvm-${METREON_PINNED_LLVM_MAJOR}/bin)
+        if(METREON_STANDALONE_TABLEGEN)
+            file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/dialect")
+            add_custom_command(
+                OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/dialect/MetreonGPUProfiles.json"
+                COMMAND "${METREON_STANDALONE_TABLEGEN}"
+                    -I "${CMAKE_CURRENT_SOURCE_DIR}/dialect"
+                    -dump-json
+                    "${CMAKE_CURRENT_SOURCE_DIR}/dialect/MetreonGPUProfiles.td"
+                    -o "${CMAKE_CURRENT_BINARY_DIR}/dialect/MetreonGPUProfiles.json"
+                DEPENDS
+                    "${CMAKE_CURRENT_SOURCE_DIR}/dialect/MetreonGPUProfiles.td"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/dialect/MetreonHardwareProfiles.td"
+                VERBATIM)
+            add_custom_target(metreon_standalone_gpu_schemas ALL
+                DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/dialect/MetreonGPUProfiles.json")
+            add_test(NAME metreon.dialect.gpu_schemas
+                COMMAND ${CMAKE_COMMAND}
+                    -DSCHEMA_DIR=${CMAKE_CURRENT_BINARY_DIR}/dialect
+                    -DTABLEGEN=${METREON_STANDALONE_TABLEGEN}
+                    -DDIALECT_DIR=${CMAKE_CURRENT_SOURCE_DIR}/dialect
+                    -DINPUT_DIR=${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/GPUProfileSchemaTests.cmake)
+        endif()
+    endif()
 
     add_executable(metreon_optimization_tests tests/OptimizationTests.cpp)
     target_link_libraries(metreon_optimization_tests PRIVATE metreon_frontend)

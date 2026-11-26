@@ -1,0 +1,11 @@
+#pragma once
+
+namespace metreon::verification::toolchain {
+inline constexpr int pinnedLLVMMajor = @METREON_PINNED_LLVM_MAJOR@;
+inline constexpr bool mlirEnabled = @METREON_MLIR_ENABLED_BOOL@;
+inline constexpr bool allowUnpinnedMLIR = @METREON_ALLOW_UNPINNED_MLIR_BOOL@;
+inline constexpr bool formalToolsEnabled = @METREON_ENABLE_FORMAL_TOOLS_BOOL@;
+inline constexpr const char *configuredLLVMMajor = "@METREON_CONFIGURED_LLVM_MAJOR@";
+inline constexpr const char *proofAssistant = "@METREON_PROOF_ASSISTANT@";
+inline constexpr const char *smtSolver = "@METREON_SMT_SOLVER@";
+} // namespace metreon::verification::toolchain

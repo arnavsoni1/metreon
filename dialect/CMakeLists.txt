@@ -36,6 +36,8 @@ find_program(LLVM_TABLEGEN_EXE NAMES llvm-tblgen
     HINTS "${LLVM_TOOLS_BINARY_DIR}" REQUIRED)
 set(LLVM_TARGET_DEFINITIONS MetreonHardwareProfiles.td)
 tablegen(LLVM MetreonHardwareProfiles.json -dump-json)
+set(LLVM_TARGET_DEFINITIONS MetreonGPUProfiles.td)
+tablegen(LLVM MetreonGPUProfiles.json -dump-json)
 set(LLVM_TARGET_DEFINITIONS Conversion/GraphIRToSeq.td)
 tablegen(LLVM GraphIRToSeq.json -dump-json)
 add_public_tablegen_target(MetreonHardwareSchemaGen)
@@ -49,4 +51,11 @@ if(BUILD_TESTING)
             -DDIALECT_DIR=${CMAKE_CURRENT_SOURCE_DIR}
             -DINPUT_DIR=${PROJECT_SOURCE_DIR}/tests/Inputs
             -P ${PROJECT_SOURCE_DIR}/tests/HardwareSchemaTests.cmake)
+    add_test(NAME metreon.dialect.gpu_schemas
+        COMMAND ${CMAKE_COMMAND}
+            -DSCHEMA_DIR=${CMAKE_CURRENT_BINARY_DIR}
+            -DTABLEGEN=${LLVM_TABLEGEN_EXE}
+            -DDIALECT_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+            -DINPUT_DIR=${PROJECT_SOURCE_DIR}/tests/Inputs
+            -P ${PROJECT_SOURCE_DIR}/tests/GPUProfileSchemaTests.cmake)
 endif()
