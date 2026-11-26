@@ -1,5 +1,6 @@
 #include "metreon/MLIR/HostExecution.h"
 #include "metreon/MLIR/Dialect.h"
+#include "metreon/MLIR/GPUVerification.h"
 #include "CanonicalSyntax.h"
 #include "ScalarLowering.h"
 
@@ -97,11 +98,15 @@ FailureOr<OwningOpRef<ModuleOp>> importHostExecution(const graphir::Module &sour
       };
       check(graph.context(), false);
       for (const auto &parameter : graph.parameters()) check(parameter.context, false);
-      graphir::walkCallableOperations(graph.body(), [&](const auto &op) {
+      graphir::walkCallableOperationsWithContext(graph.body(), {}, [&](const auto &op, const auto &effective) {
         using Kind = graphir::CallableOperationKind;
+        if (graphir::isBehavioralOrAsyncOperation(op.kind))
+          throw std::runtime_error("host execution profile does not yet lower behavioral channel or async operations");
+        if (op.kind == Kind::ContextRegion && !op.context)
+          throw std::runtime_error("host context region has no declared context");
         if ((op.kind == Kind::For || op.kind == Kind::While || op.kind == Kind::Until || op.kind == Kind::Loop) && !op.loopContext)
           throw std::runtime_error("host loop has no Host::Loop evidence");
-        check(op.context, false); check(op.loopContext, true);
+        check(effective, false); check(op.loopContext, true);
         if (op.kind == graphir::CallableOperationKind::Call && op.attributes.at("callee_kind") != "procedure" &&
             op.attributes.at("callee_kind") != "host_builtin")
           throw std::runtime_error("host execution cannot consume device/resource intrinsics");
@@ -163,16 +168,28 @@ LogicalResult verifyHostContexts(ModuleOp module) {
         if (type.getMemorySpace()) reject(op, "host code cannot dereference a GPU address");
         if (!isa_and_nonnull<memref::AllocaOp>(memory.getDefiningOp()) && (!ambient || !grant(ambient, "host_memory")))
           reject(op, "host memory access requires host_memory authority");
-      } else if (!isa<func::FuncOp, func::ReturnOp, memref::AllocaOp>(op) &&
-          op->getName().getDialectNamespace() != "arith" && op->getName().getDialectNamespace() != "cf")
+      } else if (isa<AsyncCopyOp, AsyncWaitOp, TransitionOp>(op)) {
+        // Verified by verifyGPUContextHierarchyAndLoans below.
+      } else if (!isa<func::FuncOp, func::ReturnOp, memref::AllocaOp, memref::DeallocOp>(op) &&
+          op->getName().getDialectNamespace() != "arith" && op->getName().getDialectNamespace() != "cf" &&
+          op->getName().getDialectNamespace() != "scf" && op->getName().getDialectNamespace() != "affine")
         reject(op, "operation is outside the host executable profile");
     });
   });
-  return success(valid);
+  if (!valid) return failure();
+  return verifyGPUContextHierarchyAndLoans(module);
 }
 
 FailureOr<std::vector<HostABI>> lowerHostExecution(ModuleOp module) {
   if (failed(verifyHostContexts(module))) return failure();
+  bool hasUnloweredAsyncOrResource = false;
+  module.walk([&](Operation *op) {
+    if (isa<AsyncCopyOp, AsyncWaitOp, TransitionOp, ResourceOp>(op)) {
+      op->emitError("host executable lowering requires async/resource physical specialization");
+      hasUnloweredAsyncOrResource = true;
+    }
+  });
+  if (hasUnloweredAsyncOrResource) return failure();
   auto *context = module.getContext();
   context->getOrLoadDialect<LLVM::LLVMDialect>();
   std::vector<HostABI> abi;

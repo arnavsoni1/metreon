@@ -489,9 +489,18 @@ class Importer {
       SmallVector<Attribute> targets, regions;
       for (auto ref : record.references) targets.push_back(definitionRef(ref));
       for (const auto &region : record.contextRegions) {
+        if (!region.context) fail("worker context region has no context");
+        if (region.stages.empty()) fail("worker context region has no stages");
         SmallVector<Attribute> stages;
         for (auto ref : region.stages) {
           if (ref.kind != graphir::DefinitionKind::Stage) fail("worker context region contains a non-stage");
+          if (record.kind == "fused_kernel" &&
+              std::none_of(record.references.begin(), record.references.end(), [&](const auto &item) {
+                return item.kind == ref.kind && item.index == ref.index;
+              })) fail("worker context region references a stage outside its worker");
+          const auto &stageCtx = source.stageGraphs().at(ref.index).context();
+          if (!stageCtx || !stageCtx->hasSameIdentity(*region.context))
+            fail("worker context region disagrees with stage execution context");
           stages.push_back(definitionRef(ref));
         }
         regions.push_back(dict({named("context", contextRef(region.context)), named("stages", array(stages))}));
@@ -646,6 +655,7 @@ class Importer {
         if (!op.body.empty()) attrs.push_back(named("body", importBody(op.body, effective)));
         if (op.loopContext) attrs.push_back(named("loop_context", contextRef(op.loopContext)));
         if (!op.condition.empty()) attrs.push_back(named("condition", importBody(op.condition, effective)));
+        if (!op.offerBranches.empty()) attrs.push_back(named("offer_branches", importBody(op.offerBranches, effective)));
         if (!op.alternative.empty()) attrs.push_back(named("alternative", importBody(op.alternative, effective)));
         if (!op.initialization.empty()) attrs.push_back(named("initialization", importBody(op.initialization, effective)));
         if (!op.step.empty()) attrs.push_back(named("step", importBody(op.step, effective)));
@@ -832,6 +842,7 @@ class Importer {
         attrs.push_back(named("condition", integer(condition)));
         attrs.push_back(named("successor", integer(*block.terminator.successor)));
         attrs.push_back(named("false_successor", integer(*block.terminator.falseSuccessor)));
+        if (!block.terminator.control.empty()) attrs.push_back(named("control", str(block.terminator.control)));
       } else {
         if (block.terminator.operands.size() != results.size()) fail("return signature mismatch");
         for (auto id : block.terminator.operands) {

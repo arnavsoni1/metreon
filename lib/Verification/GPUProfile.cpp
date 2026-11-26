@@ -241,6 +241,16 @@ void validatePipelineSchedule(const graphir::CompositionDefinition &schedule,
           }
         }
       }
+      for (const auto &region : record.contextRegions) {
+        if (!region.context || region.stages.empty()) {
+          recordViolation(report, VerificationStatus::Rejected,
+                          "gpu.profile.invalid_stage_context_region",
+                          record.name,
+                          "fused stage context region requires context metadata "
+                          "and at least one stage",
+                          region.location);
+        }
+      }
     } else if (record.kind == "placement") {
       const auto unitIt = record.attributes.find("unit");
       const auto workerIt = record.attributes.find("worker");

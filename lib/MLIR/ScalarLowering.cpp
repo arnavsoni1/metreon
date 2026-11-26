@@ -222,6 +222,7 @@ class ScalarCFGBuilder {
     std::map<graphir::ControlFlowBlockId, Block *> blocks{{cfg.entry, entry}};
     std::map<graphir::ControlFlowBlockId, const graphir::ControlFlowBlock *> sourceBlocks;
     std::map<Id, const graphir::CallableOperation *> operations;
+    std::map<Id, graphir::ContextMetadataRef> inheritedContexts;
     std::map<Id, Value> values, locals;
     std::map<Id, std::string> types;
     unsigned parameterIndex = 0;
@@ -229,10 +230,14 @@ class ScalarCFGBuilder {
       values.emplace(*param.id, entry->getArgument(parameterIndex++));
       types.emplace(*param.id, param.type);
     }
-    graphir::walkCallableOperations(graph.body(), [&](const auto &op) {
-      operations.emplace(op.id, &op);
-      if (auto type = op.attributes.find("type"); type != op.attributes.end()) types.emplace(op.id, type->second);
-    });
+    graphir::walkCallableOperationsWithContext(
+        graph.body(), {},
+        [&](const auto &op, const auto &effective) {
+          operations.emplace(op.id, &op);
+          inheritedContexts.emplace(op.id, effective);
+          if (auto type = op.attributes.find("type"); type != op.attributes.end())
+            types.emplace(op.id, type->second);
+        });
     for (const auto &block : cfg.blocks) {
       sourceBlocks.emplace(block.id, &block);
       if (block.id != cfg.entry) {
@@ -248,8 +253,13 @@ class ScalarCFGBuilder {
     for (const auto &block : cfg.blocks)
       for (auto id : block.operations) {
         const auto &op = *operations.at(id);
-        if (slot(op)) locals.emplace(id, builder.create<memref::AllocaOp>(
-            location(op.location), MemRefType::get({}, scalar(types.at(id)))));
+        if (slot(op)) {
+          auto alloca = builder.create<memref::AllocaOp>(
+              location(op.location), MemRefType::get({}, scalar(types.at(id))));
+          if (op.name == "$range_index")
+            alloca->setAttr("metreon.synthetic_iv", builder.getUnitAttr());
+          locals.emplace(id, alloca);
+        }
       }
 
     std::set<graphir::ControlFlowBlockId> visited;
@@ -331,14 +341,15 @@ class ScalarCFGBuilder {
           break;
         }
         case graphir::CallableOperationKind::Call: {
+          const auto inherited = inheritedContexts.at(id);
           if (hostExecution && required(op.attributes, "callee_kind") == "host_builtin") {
             OperationState state(loc, HostIntrinsicOp::getOperationName());
             const StringRef prefix = "gpu::launch::";
             const bool launch = StringRef(op.name).starts_with(prefix);
             state.addAttribute("kind", builder.getStringAttr(launch ? "gpu::launch" : op.name));
             if (launch) state.addAttribute("callee", FlatSymbolRefAttr::get(&context, StringRef(op.name).drop_front(prefix.size())));
-            if (!op.context || !op.context->hasIdentifier()) fail("host intrinsic has no nominal context");
-            state.addAttribute("context", FlatSymbolRefAttr::get(&context, op.context->identifier()));
+            if (!inherited || !inherited->hasIdentifier()) fail("host intrinsic has no nominal context");
+            state.addAttribute("context", FlatSymbolRefAttr::get(&context, inherited->identifier()));
             for (size_t index = 0; index < op.operands.size(); ++index) state.addOperands(operand(index));
             auto type = scalar(types.at(id), true);
             if (!isa<NoneType>(type)) state.addTypes(type);
@@ -347,10 +358,10 @@ class ScalarCFGBuilder {
             break;
           }
           if (deviceExecution && required(op.attributes, "callee_kind") == "gpu_builtin") {
-            if (!op.context || !op.context->hasIdentifier()) fail("device intrinsic has no declared nominal context");
+            if (!inherited || !inherited->hasIdentifier()) fail("device intrinsic has no declared nominal context");
             OperationState state(loc, DeviceIntrinsicOp::getOperationName());
             state.addAttribute("kind", builder.getStringAttr(StringRef(op.name).drop_front(5)));
-            state.addAttribute("context", FlatSymbolRefAttr::get(&context, op.context->identifier()));
+            state.addAttribute("context", FlatSymbolRefAttr::get(&context, inherited->identifier()));
             for (std::size_t index = 0; index < op.operands.size(); ++index) state.addOperands(operand(index));
             auto type = scalar(types.at(id), true);
             if (!isa<NoneType>(type)) state.addTypes(type);
@@ -372,8 +383,9 @@ class ScalarCFGBuilder {
           if (runtimeIndex != arguments.size() || types.at(id) != required((*declaration)->attributes(), "return_type"))
             fail("GraphIR call source signature mismatch");
           auto call = builder.create<func::CallOp>(loc, op.name, found->second.getResultTypes(), arguments);
-          if ((deviceExecution || hostExecution) && op.context)
-            call->setAttr("metreon.context", FlatSymbolRefAttr::get(&context, op.context->identifier()));
+          const auto callContext = op.context ? op.context : ((*declaration)->context() ? inherited : graphir::ContextMetadataRef{});
+          if ((deviceExecution || hostExecution) && callContext)
+            call->setAttr("metreon.context", FlatSymbolRefAttr::get(&context, callContext->identifier()));
           if (call.getNumResults()) result = call.getResult(0);
           break;
         }

@@ -1,5 +1,7 @@
 #include "metreon/Basic/Diagnostic.h"
+#include "metreon/GraphIR/Behavioral.h"
 #include "metreon/GraphIR/Lowering.h"
+#include "metreon/GraphIR/Passes.h"
 #include "metreon/MLIR/DeviceExecution.h"
 #include "metreon/MLIR/Dialect.h"
 #include "metreon/Parser/Parser.h"
@@ -145,9 +147,27 @@ int main(int argc, char **argv) {
     const std::string source{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
     mlir::MLIRContext context;
     compile(graph(source), context);
+    {
+      auto optimized = graph(source);
+      metreon::graphir::passes::runDefaultPipeline(optimized);
+      compile(optimized, context);
+    }
+    {
+      auto withAsync = graph(prefix + "kernel work(@cx: device; a: gpu::span<f32>) { index i = gpu::global_id(@cx); }");
+      auto body = withAsync.kernelGraphs()[0].body();
+      body.push_back(metreon::graphir::makeAsyncTokenOperation(
+          withAsync.kernelGraphs()[0],
+          {metreon::graphir::AsyncActionKind::Wait, "slot0", "0", "gpu::global",
+           "gpu::shared", "void", {}, withAsync.contexts()[0], {}}));
+      withAsync.kernelGraphs()[0].setBody(std::move(body));
+      rejected(context,
+               [&] { return mlir::success(mlir::succeeded(metreon::importDeviceExecution(withAsync, context))); },
+               "behavioral channel or async");
+    }
     compile(graph(prefix + "kernel __metreon_bodies(@cx: device; n: index) { index i = gpu::global_id(@cx); }"), context);
     failures(source, context);
-    compile(graph(prefix + R"(
+    for (const bool optimize : {false, true}) {
+      auto loopsGraph = graph(prefix + R"(
 context Gpu::Loop repeat;
 procedure add(@cx: device; a: f32, b: f32) -> f32 { return a + b; }
 kernel loops(@cx: device; a: gpu::span<f32>, b: gpu::span<f32>, out: gpu::span<f32>, n: index) {
@@ -165,7 +185,10 @@ kernel loops(@cx: device; a: gpu::span<f32>, b: gpu::span<f32>, out: gpu::span<f
     gpu::store(@cx; out, i, total);
   }
 }
-)"), context);
+)");
+      if (optimize) metreon::graphir::passes::runDefaultPipeline(loopsGraph);
+      compile(loopsGraph, context);
+    }
     std::cout << "Device execution lowering and context failures passed\n";
     return 0;
   } catch (const std::exception &error) {

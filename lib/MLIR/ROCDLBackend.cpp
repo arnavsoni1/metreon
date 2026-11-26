@@ -1,17 +1,26 @@
 #include "metreon/MLIR/DeviceExecution.h"
 #include "metreon/CodeGen/Toolchain.h"
 
+#include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
 #include "mlir/Conversion/GPUToROCDL/GPUToROCDLPass.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
+#include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
+#include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/ROCDL/ROCDLToLLVMIRTranslation.h"
@@ -34,6 +43,17 @@ FailureOr<OwningOpRef<ModuleOp>> lowerDeviceToROCDL(ModuleOp module) {
   auto *context = module.getContext();
   context->getOrLoadDialect<LLVM::LLVMDialect>();
   context->getOrLoadDialect<ROCDL::ROCDLDialect>();
+  context->getOrLoadDialect<cf::ControlFlowDialect>();
+  context->getOrLoadDialect<scf::SCFDialect>();
+  context->getOrLoadDialect<affine::AffineDialect>();
+  context->getOrLoadDialect<ub::UBDialect>();
+
+  OwningOpRef<ModuleOp> working(module.clone());
+  PassManager lowerStructured(context);
+  lowerStructured.addPass(createLowerAffinePass());
+  lowerStructured.addPass(createConvertSCFToCFPass());
+  if (failed(lowerStructured.run(*working))) return failure();
+
   LowerToLLVMOptions options(context);
   // AMD allocas live in private address space 5. Obtain the target layout
   // before converting memref slots rather than inheriting a host layout.
@@ -47,10 +67,7 @@ FailureOr<OwningOpRef<ModuleOp>> lowerDeviceToROCDL(ModuleOp module) {
       "amdgcn-amd-amdhsa", "gfx900", "", llvm::TargetOptions{}, llvm::Reloc::PIC_));
   if (!layout) { module.emitError("AMDGPU target layout unavailable"); return failure(); }
   options.dataLayout = layout->createDataLayout();
-  // GraphIR's scalar slots are invocation-local. MemRefToLLVM uses the memref
-  // address space for allocas, so mark those slots private explicitly; the
-  // target data layout alone does not change a memref's default memory space.
-  module.walk([&](memref::AllocaOp local) {
+  working->walk([&](memref::AllocaOp local) {
     auto type = local.getType();
     local.getResult().setType(MemRefType::get(type.getShape(), type.getElementType(), type.getLayout(),
         IntegerAttr::get(IntegerType::get(context, 64), 5)));
@@ -62,16 +79,17 @@ FailureOr<OwningOpRef<ModuleOp>> lowerDeviceToROCDL(ModuleOp module) {
   populateFuncToLLVMConversionPatterns(converter, patterns);
   arith::populateArithToLLVMConversionPatterns(converter, patterns);
   cf::populateControlFlowToLLVMConversionPatterns(converter, patterns);
+  ub::populateUBToLLVMConversionPatterns(converter, patterns);
   populateFinalizeMemRefToLLVMConversionPatterns(converter, patterns);
   ConversionTarget target(*context);
   configureGpuToROCDLConversionLegality(target);
   target.addLegalDialect<LLVM::LLVMDialect, ROCDL::ROCDLDialect>();
   target.addLegalOp<ModuleOp, gpu::GPUModuleOp, gpu::ModuleEndOp>();
-  if (failed(applyFullConversion(module, target, std::move(patterns))) || failed(verify(module))) return failure();
+  if (failed(applyFullConversion(*working, target, std::move(patterns))) || failed(verify(*working))) return failure();
   // Hardware IDs and dimensions are unsigned 32-bit values. Preserve their
   // full range when realizing Metreon's 64-bit index arithmetic.
   SmallVector<LLVM::SExtOp> indexExtensions;
-  module.walk([&](LLVM::SExtOp op) {
+  working->walk([&](LLVM::SExtOp op) {
     if (isa_and_nonnull<ROCDL::BlockIdXOp, ROCDL::BlockIdYOp, ROCDL::BlockIdZOp,
         ROCDL::ThreadIdXOp, ROCDL::ThreadIdYOp, ROCDL::ThreadIdZOp,
         ROCDL::BlockDimXOp, ROCDL::BlockDimYOp, ROCDL::BlockDimZOp,
@@ -83,9 +101,9 @@ FailureOr<OwningOpRef<ModuleOp>> lowerDeviceToROCDL(ModuleOp module) {
     op.replaceAllUsesWith(replacement.getResult());
     op.erase();
   }
-  auto output = OwningOpRef<ModuleOp>(ModuleOp::create(module.getLoc()));
+  auto output = OwningOpRef<ModuleOp>(ModuleOp::create(working->getLoc()));
   unsigned modules = 0;
-  for (auto device : module.getOps<gpu::GPUModuleOp>()) {
+  for (auto device : working->getOps<gpu::GPUModuleOp>()) {
     ++modules;
     for (auto &op : device.getBody()->without_terminator()) output->getBody()->push_back(op.clone());
   }

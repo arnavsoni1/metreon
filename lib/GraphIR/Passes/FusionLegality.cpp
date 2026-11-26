@@ -61,7 +61,8 @@ void verifyPipeline(const Module &module, const PipelineGraph &pipeline) {
           dependencies.at(callee->second).insert(caller);
         }
         for (const auto *children : {&operation.initialization, &operation.condition,
-                                    &operation.body, &operation.alternative, &operation.step})
+                                    &operation.offerBranches, &operation.body,
+                                    &operation.alternative, &operation.step})
           calls(*children);
       }
     };
@@ -92,6 +93,21 @@ void verifyPipeline(const Module &module, const PipelineGraph &pipeline) {
         if (context && !context->hasSameIdentity(*stageContext))
           fail("fusion_context_mismatch", "fused stages require different nominal execution contexts", worker.location);
         context = stageContext;
+      }
+      for (const auto &region : worker.contextRegions) {
+        if (!region.context)
+          fail("invalid_stage_context_region", "fused stage context region has no context metadata", region.location);
+        module.requireContextUse(region.context, ContextUse::MetadataAttachment);
+        if (region.stages.empty())
+          fail("empty_stage_context_region", "fused stage context region requires at least one stage", region.location);
+        for (const auto stageRef : region.stages) {
+          if (stageRef.kind != DefinitionKind::Stage || !owners.contains(stageRef.index) ||
+              owners.at(stageRef.index) != group)
+            fail("stage_region_outside_worker", "stage context region refers to a stage outside its fused worker", region.location);
+          const auto &stageContext = module.stageGraphs().at(stageRef.index).context();
+          if (!stageContext || !stageContext->hasSameIdentity(*region.context))
+            fail("stage_region_context_mismatch", "stage context region disagrees with stage nominal execution context", region.location);
+        }
       }
     }
     if (!hasFusion) continue;

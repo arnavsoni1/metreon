@@ -7,15 +7,30 @@
 namespace metreon::graphir::passes {
 namespace {
 
+bool isHoistableContextAction(CallableOperationKind kind) noexcept {
+  switch (kind) {
+  case CallableOperationKind::Call:
+  case CallableOperationKind::ChannelSend:
+  case CallableOperationKind::ChannelReceive:
+  case CallableOperationKind::ProgressMarker:
+  case CallableOperationKind::AsyncIssue:
+  case CallableOperationKind::AsyncWait:
+    return true;
+  default:
+    return false;
+  }
+}
+
 void hoistBody(CallableGraph &callable, std::vector<CallableOperation> &body) {
   for (auto &operation : body)
     for (auto *children : {&operation.initialization, &operation.condition,
-                          &operation.body, &operation.alternative, &operation.step})
+                           &operation.offerBranches, &operation.body,
+                           &operation.alternative, &operation.step})
       hoistBody(callable, *children);
   std::vector<CallableOperation> result;
   for (std::size_t index = 0; index < body.size();) {
     const auto &first = body[index];
-    if (first.kind != CallableOperationKind::Call || !first.context) {
+    if (!isHoistableContextAction(first.kind) || !first.context) {
       result.push_back(std::move(body[index++]));
       continue;
     }
@@ -26,7 +41,7 @@ void hoistBody(CallableGraph &callable, std::vector<CallableOperation> &body) {
       if ((operation.kind == CallableOperationKind::Literal ||
            operation.kind == CallableOperationKind::Variable) && !operation.context)
         continue;
-      if (operation.kind != CallableOperationKind::Call || !operation.context ||
+      if (!isHoistableContextAction(operation.kind) || !operation.context ||
           !operation.context->hasSameIdentity(*first.context))
         break;
       last = next;

@@ -1,13 +1,18 @@
 #include "metreon/MLIR/DeviceExecution.h"
-#include "metreon/MLIR/Dialect.h"
 #include "CanonicalSyntax.h"
 #include "ScalarLowering.h"
+#include "metreon/MLIR/Dialect.h"
+#include "metreon/MLIR/GPUVerification.h"
+#include "metreon/Verification/GPUOwnershipAndLoans.h"
 
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Transforms/DialectConversion.h"
 
@@ -40,10 +45,13 @@ void graphContextChecks(const graphir::Module &source, ArrayRef<const graphir::C
   };
   for (const auto *graph : graphs) {
     const auto ambient = graph->context();
+    std::optional<verification::GPUExecutionScope> ambientScope;
     if (ambient) {
       owned(ambient);
       const auto type = Syntax::type(ambient->name()).name.str();
-      if (!type.starts_with("Gpu::") || type == "Gpu::Loop") throw std::runtime_error("device execution requires a Gpu execution context");
+      ambientScope = verification::classifyContextExecutionScope(ambient->name());
+      if (!type.starts_with("Gpu::") || type == "Gpu::Loop" || !ambientScope)
+        throw std::runtime_error("device execution requires a Gpu execution context");
     }
     const auto domain = graph->attributes().at("execution_domain");
     if (domain != (ambient ? "Gpu" : "context_independent") && !(domain == "Gpu" && !ambient))
@@ -52,10 +60,14 @@ void graphContextChecks(const graphir::Module &source, ArrayRef<const graphir::C
       owned(parameter.context);
       if (!ambient || !ambient->hasSameIdentity(*parameter.context)) throw std::runtime_error("parameter changes nominal execution context");
     }
-    graphir::walkCallableOperations(graph->body(), [&](const auto &op) {
-      if (op.context) {
-        owned(op.context);
-        if (!ambient || !ambient->hasSameIdentity(*op.context)) throw std::runtime_error("operation changes nominal execution context");
+    graphir::walkCallableOperationsWithContext(graph->body(), {}, [&](const auto &op, const auto &effective) {
+      if (graphir::isBehavioralOrAsyncOperation(op.kind))
+        throw std::runtime_error("device execution profile does not yet lower behavioral channel or async operations");
+      if (op.kind == Kind::ContextRegion && !op.context)
+        throw std::runtime_error("device context region has no declared context");
+      if (effective) {
+        owned(effective);
+        if (!ambient || !ambient->hasSameIdentity(*effective)) throw std::runtime_error("operation changes nominal execution context");
       }
       const bool loop = op.kind == Kind::For || op.kind == Kind::Loop || op.kind == Kind::While || op.kind == Kind::Until;
       if (loop || op.loopContext) {
@@ -68,13 +80,17 @@ void graphContextChecks(const graphir::Module &source, ArrayRef<const graphir::C
       if (op.kind == Kind::Call) {
         const auto kind = op.attributes.at("callee_kind");
         if (kind == "gpu_builtin") {
-          if (!op.context || (op.name != "gpu::global_id" && op.name != "gpu::load" && op.name != "gpu::store"))
+          if (!effective || (op.name != "gpu::global_id" && op.name != "gpu::load" && op.name != "gpu::store" &&
+                             op.name != "gpu::barrier" && op.name != "gpu::warp_barrier" && op.name != "gpu::grid_barrier"))
             throw std::runtime_error("unknown or context-free GPU intrinsic");
+          if (ambientScope && !verification::isIntrinsicAllowedInScope(*ambientScope, op.name))
+            throw std::runtime_error("GPU intrinsic `" + op.name + "` is forbidden in `" + ambient->name() + "` scope");
         } else if (kind == "procedure") {
           auto found = procedures.find(op.name);
           if (found == procedures.end()) throw std::runtime_error("device call has no procedure declaration");
           const auto target = found->second->context();
           if (target && (!ambient || !target->hasSameIdentity(*ambient))) throw std::runtime_error("call requires a different nominal execution context");
+          if (target && !effective) throw std::runtime_error("device call is missing nominal execution context");
         } else throw std::runtime_error("device execution does not implement this call kind");
       }
     });
@@ -109,9 +125,13 @@ struct IntrinsicConversion : OpConversionPattern<DeviceIntrinsicOp> {
       rewriter.replaceOpWithNewOp<arith::AddIOp>(op, offset, thread);
     } else if (op.getKind() == "load") {
       rewriter.replaceOpWithNewOp<memref::LoadOp>(op, args[0], ValueRange{args[1]});
-    } else {
+    } else if (op.getKind() == "store") {
       rewriter.create<memref::StoreOp>(op.getLoc(), args[2], args[0], ValueRange{args[1]});
       rewriter.eraseOp(op);
+    } else if (op.getKind() == "barrier") {
+      rewriter.replaceOpWithNewOp<gpu::BarrierOp>(op);
+    } else {
+      return rewriter.notifyMatchFailure(op, "device intrinsic requires target specialization");
     }
     return success();
   }
@@ -129,8 +149,6 @@ template <typename Contract> struct CallableConversion : OpConversionPattern<Con
       auto kernel = rewriter.template create<gpu::GPUFuncOp>(op.getLoc(), op.getSymName(), op.getFunctionType());
       kernel->setAttr(gpu::GPUDialect::getKernelFuncAttrName(), rewriter.getUnitAttr());
       rewriter.inlineRegionBefore(body.getBody(), kernel.getBody(), kernel.getBody().end());
-      // GPUFuncOp's builder creates its entry block. Remove that empty block
-      // before transferring the checked function body.
       if (kernel.getBody().front().empty()) rewriter.eraseBlock(&kernel.getBody().front());
       SmallVector<func::ReturnOp> returns;
       kernel.walk([&](func::ReturnOp ret) { returns.push_back(ret); });
@@ -238,9 +256,15 @@ LogicalResult verifyDeviceContexts(ModuleOp module) {
       reject(contract, "device contract requires a defined function body with the same name");
     if (function.getFunctionType() != cast<TypeAttr>(contract->getAttr("function_type")).getValue())
       reject(contract, "device body signature disagrees with contract");
-    for (auto type : function.getArgumentTypes()) if (!scalar(type) && !deviceSpan(type))
-      reject(contract, "device parameters must be scalars or dynamic f32 global spans");
-    for (auto type : function.getResultTypes()) if (!scalar(type))
+    for (auto type : function.getArgumentTypes()) {
+      if (!scalar(type) && !deviceSpan(type) && !isa<ResourceType, OwnedType>(type)) {
+        if (auto mem = dyn_cast<MemRefType>(type)) {
+          if (auto space = dyn_cast_or_null<IntegerAttr>(mem.getMemorySpace()); !space || (space.getInt() != 1 && space.getInt() != 3))
+            reject(contract, "device parameters must be scalars or GPU global/shared spans");
+        } else reject(contract, "device parameters must be scalars or dynamic f32 global spans");
+      }
+    }
+    for (auto type : function.getResultTypes()) if (!scalar(type) && !isa<ResourceType, OwnedType>(type))
       reject(contract, "device helper results must be scalars");
     auto ambient = resolveContext(contract, contract->getAttrOfType<SymbolRefAttr>("context"));
     if (contract->hasAttr("context") && !ambient) reject(contract, "unknown nominal execution context");
@@ -249,7 +273,8 @@ LogicalResult verifyDeviceContexts(ModuleOp module) {
       reject(contract, "device body execution domain disagrees with its context");
     if (ambient) {
       const auto nominal = ambient.getNominalType().getAs<StringAttr>("name").getValue();
-      if (!nominal.starts_with("Gpu::") || nominal == "Gpu::Loop") reject(contract, "device body requires a Gpu execution context");
+      if (!nominal.starts_with("Gpu::") || nominal == "Gpu::Loop" || !verification::classifyContextExecutionScope(nominal))
+        reject(contract, "device body requires a Gpu execution context");
     }
     if (auto loops = function->getAttrOfType<ArrayAttr>("metreon.loop_contexts")) for (auto item : loops) {
       auto loop = resolveContext(function, dyn_cast<SymbolRefAttr>(item));
@@ -263,7 +288,13 @@ LogicalResult verifyDeviceContexts(ModuleOp module) {
         if (!grant.empty() && !grants(selected, grant)) reject(op, ("device context lacks required grant: " + grant).str());
       };
       if (auto intrinsic = dyn_cast<DeviceIntrinsicOp>(op)) {
-        require(resolveContext(op, intrinsic.getContextAttr()), intrinsic.getKind() == "load" ? "gpu_load" : intrinsic.getKind() == "store" ? "gpu_store" : "");
+        const auto kind = intrinsic.getKind();
+        StringRef req = kind == "load" ? "gpu_load" : kind == "store" ? "gpu_store"
+            : kind == "barrier" ? "gpu_barrier" : kind == "warp_barrier" ? "gpu_warp_barrier"
+            : kind == "grid_barrier" ? "gpu_grid_sync" : "";
+        require(resolveContext(op, intrinsic.getContextAttr()), req);
+      } else if (isa<AsyncCopyOp, AsyncWaitOp, TransitionOp>(op)) {
+        // Verified in detail by verifyGPUContextHierarchyAndLoans below.
       } else if (auto call = dyn_cast<func::CallOp>(op)) {
         auto target = contracts.find(call.getCallee().str());
         if (target == contracts.end() || !isa<ProcedureOp>(target->second)) { reject(op, "device call has no procedure contract"); return; }
@@ -273,38 +304,63 @@ LogicalResult verifyDeviceContexts(ModuleOp module) {
           if (targetContext != ambient) reject(op, "callee requires a different nominal execution context");
         }
       } else if (auto load = dyn_cast<memref::LoadOp>(op)) {
-        if (load.getMemRefType().getRank() != 0 && !deviceSpan(load.getMemRefType()))
-          reject(op, "device memory access requires an f32 global span");
+        if (load.getMemRefType().getRank() != 0 && !deviceSpan(load.getMemRefType())) {
+          auto space = dyn_cast_or_null<IntegerAttr>(load.getMemRefType().getMemorySpace());
+          if (!space || space.getInt() != 3) reject(op, "device memory access requires an f32 global or shared span");
+        }
         if (load.getMemRefType().getMemorySpace() || !isa_and_nonnull<memref::AllocaOp>(load.getMemref().getDefiningOp()))
           require(ambient, "gpu_load");
       } else if (auto store = dyn_cast<memref::StoreOp>(op)) {
-        if (store.getMemRefType().getRank() != 0 && !deviceSpan(store.getMemRefType()))
-          reject(op, "device memory access requires an f32 global span");
+        if (store.getMemRefType().getRank() != 0 && !deviceSpan(store.getMemRefType())) {
+          auto space = dyn_cast_or_null<IntegerAttr>(store.getMemRefType().getMemorySpace());
+          if (!space || space.getInt() != 3) reject(op, "device memory access requires an f32 global or shared span");
+        }
         if (store.getMemRefType().getMemorySpace() || !isa_and_nonnull<memref::AllocaOp>(store.getMemref().getDefiningOp()))
           require(ambient, "gpu_store");
+      } else if (isa<affine::AffineLoadOp>(op)) {
+        require(ambient, "gpu_load");
+      } else if (isa<affine::AffineStoreOp>(op)) {
+        require(ambient, "gpu_store");
       } else if (isa<gpu::BlockIdOp, gpu::BlockDimOp, gpu::ThreadIdOp>(op)) {
         require(ambient, "");
+      } else if (isa<gpu::BarrierOp>(op)) {
+        require(ambient, "gpu_barrier");
       } else if (auto local = dyn_cast<memref::AllocaOp>(op)) {
         if (local.getType().getRank() || local.getType().getMemorySpace() || !scalar(local.getType().getElementType()))
           reject(op, "device local slots must hold scalars in the default address space");
       } else {
         const auto dialect = op->getName().getDialectNamespace();
-        if (dialect != "arith" && dialect != "cf" &&
+        if (dialect != "arith" && dialect != "cf" && dialect != "scf" &&
+            dialect != "affine" && dialect != "ub" &&
             !isa<func::FuncOp, func::ReturnOp>(op))
           reject(op, "operation is outside the context-only device profile");
       }
     });
   }
   module.walk([&](func::FuncOp function) { if (!bodies.contains(function)) reject(function, "uncontracted function in device module"); });
-  return success(valid);
+  if (!valid) return failure();
+  return verifyGPUContextHierarchyAndLoans(module);
 }
 
 LogicalResult lowerMetreonDeviceToGPU(ModuleOp module) {
-  // Recheck the live MLIR, including parsed or edited bodies. No GraphIR object
-  // or cached `verified` flag is consulted by this conversion.
+  // Recheck the live MLIR, including parsed or edited bodies, scope hierarchy,
+  // path-sensitive ownership typestates, and async generation loans.
   if (failed(verifyDeviceContexts(module))) return failure();
+  bool hasUnloweredAsyncOrResource = false;
+  module.walk([&](Operation *op) {
+    if (isa<AsyncCopyOp, AsyncWaitOp, TransitionOp, ResourceOp>(op)) {
+      op->emitError("device executable lowering requires async/resource physical specialization");
+      hasUnloweredAsyncOrResource = true;
+    }
+  });
+  if (hasUnloweredAsyncOrResource) return failure();
+
   auto *context = module.getContext();
   context->getOrLoadDialect<gpu::GPUDialect>();
+  context->getOrLoadDialect<scf::SCFDialect>();
+  context->getOrLoadDialect<affine::AffineDialect>();
+  context->getOrLoadDialect<ub::UBDialect>();
+
   OpBuilder builder(context);
   builder.setInsertionPointToEnd(module.getBody());
   std::string name = "__metreon_device";
@@ -320,11 +376,26 @@ LogicalResult lowerMetreonDeviceToGPU(ModuleOp module) {
   SmallVector<ModuleOp> empty;
   for (auto nested : module.getOps<ModuleOp>()) if (nested.getBody()->empty()) empty.push_back(nested);
   for (auto nested : empty) nested.erase();
+
+  // Unify with GPULowering: lift device CFGs inside `gpu.module` to structured
+  // `scf`/`affine` control flow while preserving user mutable `memref.alloca` slots.
+  if (failed(structureGPUFunctionControlFlow(module, /*promoteAllScalarSlots=*/false)))
+    return failure();
+
   module.walk([](Operation *op) {
     SmallVector<StringAttr> remove;
     for (auto attribute : op->getAttrs()) if (attribute.getName().getValue().starts_with("metreon.")) remove.push_back(attribute.getName());
     for (auto name : remove) op->removeAttr(name);
   });
+
+  bool leftCFG = false;
+  device.walk([&](Operation *op) {
+    if (op->getName().getDialectNamespace() == "cf") {
+      op->emitError("device GPU structuring left unstructured CFG branches");
+      leftCFG = true;
+    }
+  });
+  if (leftCFG) return failure();
   return verify(module);
 }
 

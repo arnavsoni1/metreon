@@ -69,10 +69,14 @@ class HostLowering {
       hostContext(graph.context(), false);
       for (const auto &param : graph.parameters())
         if (param.context) hostContext(param.context, false);
-      graphir::walkCallableOperations(graph.body(), [&](const auto &op) {
+      graphir::walkCallableOperationsWithContext(graph.body(), {}, [&](const auto &op, const auto &effective) {
         current = op.location;
-        hostContext(op.context, false);
+        if (op.kind == graphir::CallableOperationKind::ContextRegion && !op.context)
+          fail("host context region requires an explicit host context");
+        hostContext(effective, false);
         hostContext(op.loopContext, true);
+        if (graphir::isBehavioralOrAsyncOperation(op.kind))
+          fail("host scalar LLVM lowering requires behavioral/async legalization first");
         switch (op.kind) {
         case graphir::CallableOperationKind::IteratorInit:
         case graphir::CallableOperationKind::IteratorHasNext:

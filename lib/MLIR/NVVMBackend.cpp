@@ -1,5 +1,6 @@
 #include "metreon/MLIR/DeviceExecution.h"
 
+#include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
@@ -7,10 +8,18 @@
 #include "mlir/Conversion/LLVMCommon/LoweringOptions.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
+#include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
+#include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/NVVM/NVVMToLLVMIRTranslation.h"
@@ -30,6 +39,17 @@ FailureOr<OwningOpRef<ModuleOp>> lowerDeviceToNVVM(ModuleOp module) {
   auto *context = module.getContext();
   context->getOrLoadDialect<LLVM::LLVMDialect>();
   context->getOrLoadDialect<NVVM::NVVMDialect>();
+  context->getOrLoadDialect<cf::ControlFlowDialect>();
+  context->getOrLoadDialect<scf::SCFDialect>();
+  context->getOrLoadDialect<affine::AffineDialect>();
+  context->getOrLoadDialect<ub::UBDialect>();
+
+  OwningOpRef<ModuleOp> working(module.clone());
+  PassManager lowerStructured(context);
+  lowerStructured.addPass(createLowerAffinePass());
+  lowerStructured.addPass(createConvertSCFToCFPass());
+  if (failed(lowerStructured.run(*working))) return failure();
+
   LowerToLLVMOptions options(context);
   options.overrideIndexBitwidth(64);
   LLVMTypeConverter converter(context, options);
@@ -38,15 +58,16 @@ FailureOr<OwningOpRef<ModuleOp>> lowerDeviceToNVVM(ModuleOp module) {
   populateFuncToLLVMConversionPatterns(converter, patterns);
   arith::populateArithToLLVMConversionPatterns(converter, patterns);
   cf::populateControlFlowToLLVMConversionPatterns(converter, patterns);
+  ub::populateUBToLLVMConversionPatterns(converter, patterns);
   populateFinalizeMemRefToLLVMConversionPatterns(converter, patterns);
   ConversionTarget target(*context);
   configureGpuToNVVMConversionLegality(target);
   target.addLegalDialect<LLVM::LLVMDialect, NVVM::NVVMDialect>();
   target.addLegalOp<ModuleOp, gpu::GPUModuleOp, gpu::ModuleEndOp>();
-  if (failed(applyFullConversion(module, target, std::move(patterns))) || failed(verify(module))) return failure();
-  auto output = OwningOpRef<ModuleOp>(ModuleOp::create(module.getLoc()));
+  if (failed(applyFullConversion(*working, target, std::move(patterns))) || failed(verify(*working))) return failure();
+  auto output = OwningOpRef<ModuleOp>(ModuleOp::create(working->getLoc()));
   unsigned modules = 0;
-  for (auto device : module.getOps<gpu::GPUModuleOp>()) {
+  for (auto device : working->getOps<gpu::GPUModuleOp>()) {
     ++modules;
     for (auto &op : device.getBody()->without_terminator()) output->getBody()->push_back(op.clone());
   }

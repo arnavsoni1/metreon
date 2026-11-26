@@ -1,5 +1,7 @@
 #include "metreon/Basic/Diagnostic.h"
+#include "metreon/GraphIR/Behavioral.h"
 #include "metreon/GraphIR/Lowering.h"
+#include "metreon/GraphIR/Passes.h"
 #include "metreon/MLIR/Dialect.h"
 #include "metreon/MLIR/HostExecution.h"
 #include "metreon/Parser/Parser.h"
@@ -52,6 +54,16 @@ int main(int argc, char **argv) {
     const std::string source{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
     auto original = graph(source);
     mlir::MLIRContext context;
+    for (const bool optimize : {false, true}) {
+      auto candidate = graph(source);
+      if (optimize) metreon::graphir::passes::runDefaultPipeline(candidate);
+      auto liveCandidate = import(candidate, context);
+      auto loweredCandidate = metreon::lowerHostExecution(*liveCandidate);
+      check(mlir::succeeded(loweredCandidate) && !loweredCandidate->empty(), "host ABI lowering failed");
+      liveCandidate->walk([&](mlir::Operation *op) {
+        check(mlir::isa<mlir::ModuleOp>(op) || op->getName().getDialectNamespace() == "llvm", "non-LLVM host operation remains");
+      });
+    }
     auto live = import(original, context);
     auto lowered = metreon::lowerHostExecution(*live);
     check(mlir::succeeded(lowered) && !lowered->empty(), "host ABI lowering failed");

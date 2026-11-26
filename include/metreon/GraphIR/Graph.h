@@ -267,7 +267,9 @@ using CallableValueId = std::size_t;
 enum class CallableOperationKind {
   Literal, Variable, Call, Block, Return, ContextRegion,
   Unary, Binary, Load, Assign, If, Loop, For, While, Until, Break, Continue,
-  IteratorInit, IteratorHasNext, IteratorValue, IteratorAdvance
+  IteratorInit, IteratorHasNext, IteratorValue, IteratorAdvance,
+  ChannelSend, ChannelReceive, Offer, FairChoice, ProgressMarker,
+  AsyncIssue, AsyncWait
 };
 
 struct CallableOperation {
@@ -281,13 +283,19 @@ struct CallableOperation {
   SourceLocation location;
   // Structured source control flow is projected into the existing callable CFG.
   // Loop authority is metadata independent of the operation's execution context.
-  std::vector<CallableOperation> condition{}, alternative{}, initialization{}, step{};
+  std::vector<CallableOperation> condition{}, alternative{}, initialization{}, step{}, offerBranches{};
   ContextMetadataRef loopContext{};
 };
 
 const char *callableOperationKindName(CallableOperationKind kind);
+bool isBehavioralOrAsyncOperation(CallableOperationKind kind) noexcept;
 void walkCallableOperations(const std::vector<CallableOperation> &body,
     const std::function<void(const CallableOperation &)> &visit);
+void walkCallableOperationsWithContext(
+    const std::vector<CallableOperation> &body,
+    ContextMetadataRef inheritedRegionContext,
+    const std::function<void(const CallableOperation &,
+                             const ContextMetadataRef &)> &visit);
 bool hasStructuredControlFlow(const std::vector<CallableOperation> &body);
 
 struct CallableParameter {

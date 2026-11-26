@@ -200,4 +200,44 @@ def Metreon_TransitionOp : Metreon_Op<"transition", [
   let hasVerifier = 1;
 }
 
+def Metreon_AsyncCopyOp : Metreon_Op<"async_copy", [
+  DeclareOpInterfaceMethods<SymbolUserOpInterface>,
+  MemoryEffects<[MemRead, MemWrite]>
+]> {
+  let summary = "Issue a context-authorized, generation-tracked asynchronous buffer transfer";
+  let description = [{
+    Models an asynchronous host-device or device-shared memory transfer keyed by
+    an explicit `(slot, generation)` token. While in flight, `source` is held
+    under an immutable read loan and `destination` is held under an exclusive
+    write loan until a dominating `metreon.async_wait` completes the exact
+    matching `(slot, generation)` pair.
+  }];
+  let arguments = (ins
+    StrAttr:$slot,
+    StrAttr:$generation,
+    SymbolRefAttr:$context,
+    AnyMemRef:$source,
+    AnyMemRef:$destination
+  );
+  let hasVerifier = 1;
+}
+
+def Metreon_AsyncWaitOp : Metreon_Op<"async_wait", [
+  DeclareOpInterfaceMethods<SymbolUserOpInterface>,
+  MemoryEffects<[MemRead, MemWrite]>
+]> {
+  let summary = "Complete an in-flight asynchronous transfer for an exact slot and generation";
+  let description = [{
+    Completes the in-flight asynchronous transfer identified by `(slot, generation)`
+    and releases its associated source and destination buffer loans. Waiting on
+    an unissued or already-completed generation is rejected by GPU loan analysis.
+  }];
+  let arguments = (ins
+    StrAttr:$slot,
+    StrAttr:$generation,
+    SymbolRefAttr:$context
+  );
+  let hasVerifier = 1;
+}
+
 #endif // METREON_RESOURCE_OPS_TD

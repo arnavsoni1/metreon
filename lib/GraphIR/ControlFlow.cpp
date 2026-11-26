@@ -57,16 +57,68 @@ private:
     auto tested = appendBody(op.condition, initial, scopes);
     if (!tested || op.operands.size() != 1) throw std::logic_error("invalid conditional predicate");
     auto yes = addBlock(scopes, op.location), no = addBlock(scopes, op.location);
-    graph_.blocks[yes].attributes.emplace("role", "if.then");
-    graph_.blocks[no].attributes.emplace("role", "if.else");
+    const bool fair = op.kind == CallableOperationKind::FairChoice;
+    graph_.blocks[yes].attributes.emplace("role", fair ? "fair.then" : "if.then");
+    graph_.blocks[no].attributes.emplace("role", fair ? "fair.else" : "if.else");
+    if (fair) {
+      if (op.name.empty()) throw std::logic_error("fair choice requires a tag name");
+      graph_.blocks[yes].attributes.emplace("fair_tag", op.name);
+      graph_.blocks[no].attributes.emplace("fair_tag", op.name);
+      if (const auto justified = op.attributes.find("assumption_justified");
+          justified != op.attributes.end()) {
+        graph_.blocks[yes].attributes.emplace("assumption_justified", justified->second);
+        graph_.blocks[no].attributes.emplace("assumption_justified", justified->second);
+      }
+    }
     conditionalBranch(*tested, op.operands.front(), yes, no, op);
+    if (fair) graph_.blocks[*tested].terminator.control = "fair:" + op.name;
     auto yesEnd = appendBody(op.body, yes, scopes);
     auto noEnd = appendBody(op.alternative, no, scopes);
     if (!yesEnd && !noEnd) return std::nullopt;
     const auto join = addBlock(scopes, op.location);
-    graph_.blocks[join].attributes.emplace("role", "if.join");
+    graph_.blocks[join].attributes.emplace("role", fair ? "fair.join" : "if.join");
     if (yesEnd) branch(*yesEnd, join, op.location);
     if (noEnd) branch(*noEnd, join, op.location);
+    return join;
+  }
+
+  std::optional<ControlFlowBlockId> offer(const CallableOperation &op,
+      ControlFlowBlockId initial, const std::vector<CallableValueId> &scopes) {
+    auto ready = appendBody(op.condition, initial, scopes);
+    if (!ready) throw std::logic_error("offer readiness evaluation cannot terminate control flow");
+    if (op.offerBranches.empty() || op.operands.size() != op.offerBranches.size())
+      throw std::logic_error("offer requires one readiness operand per offer branch");
+    const auto modeIt = op.attributes.find("offer_mode");
+    const std::string mode = modeIt != op.attributes.end() ? modeIt->second : "exclusive";
+    std::vector<ControlFlowBlockId> continuations;
+    ControlFlowBlockId dispatch = *ready;
+    for (std::size_t index = 0; index < op.offerBranches.size(); ++index) {
+      const auto &arm = op.offerBranches[index];
+      const auto armBlock = addBlock(scopes, arm.location);
+      graph_.blocks[armBlock].attributes.emplace("role", "offer.branch");
+      graph_.blocks[armBlock].attributes.emplace("offer_mode", mode);
+      graph_.blocks[armBlock].attributes.emplace("branch_index", std::to_string(index));
+      if (!arm.name.empty()) graph_.blocks[armBlock].attributes.emplace("action", arm.name);
+      const auto fallbackBlock = addBlock(scopes, op.location);
+      if (index + 1 == op.offerBranches.size()) {
+        graph_.blocks[fallbackBlock].attributes.emplace("role", "offer.default");
+        graph_.blocks[fallbackBlock].attributes.emplace("offer_mode", mode);
+      } else {
+        graph_.blocks[fallbackBlock].attributes.emplace("role", "offer.next");
+        graph_.blocks[fallbackBlock].attributes.emplace("offer_mode", mode);
+      }
+      conditionalBranch(dispatch, op.operands[index], armBlock, fallbackBlock, op);
+      graph_.blocks[dispatch].terminator.control = "offer:" + mode;
+      if (const auto armEnd = appendBody(arm.body, armBlock, scopes))
+        continuations.push_back(*armEnd);
+      dispatch = fallbackBlock;
+    }
+    if (const auto defaultEnd = appendBody(op.alternative, dispatch, scopes))
+      continuations.push_back(*defaultEnd);
+    if (continuations.empty()) return std::nullopt;
+    const auto join = addBlock(scopes, op.location);
+    graph_.blocks[join].attributes.emplace("role", "offer.join");
+    for (const auto endBlock : continuations) branch(endBlock, join, op.location);
     return join;
   }
 
@@ -135,7 +187,11 @@ private:
       }
       switch (operation.kind) {
       case CallableOperationKind::If:
+      case CallableOperationKind::FairChoice:
         current = conditional(operation, *current, scopes);
+        break;
+      case CallableOperationKind::Offer:
+        current = offer(operation, *current, scopes);
         break;
       case CallableOperationKind::Loop: case CallableOperationKind::For:
       case CallableOperationKind::While: case CallableOperationKind::Until:
@@ -182,6 +238,9 @@ private:
       case CallableOperationKind::Load: case CallableOperationKind::Assign:
       case CallableOperationKind::IteratorInit: case CallableOperationKind::IteratorHasNext:
       case CallableOperationKind::IteratorValue: case CallableOperationKind::IteratorAdvance:
+      case CallableOperationKind::ChannelSend: case CallableOperationKind::ChannelReceive:
+      case CallableOperationKind::ProgressMarker:
+      case CallableOperationKind::AsyncIssue: case CallableOperationKind::AsyncWait:
         graph_.blocks[*current].operations.push_back(operation.id);
         break;
       }

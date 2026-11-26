@@ -277,6 +277,26 @@ LogicalResult TransitionOp::verifySymbolUses(SymbolTableCollection &tables) {
     return emitOpError("transition operands/result disagree with the declaration");
   return references(*this, tables);
 }
+LogicalResult AsyncCopyOp::verify() {
+  if (getSlot().empty() || getGeneration().empty())
+    return emitOpError("async_copy requires non-empty slot and generation");
+  auto srcType = cast<MemRefType>(getSource().getType());
+  auto dstType = cast<MemRefType>(getDestination().getType());
+  if (srcType.getElementType() != dstType.getElementType())
+    return emitOpError("async_copy source and destination element types must match");
+  return success();
+}
+LogicalResult AsyncCopyOp::verifySymbolUses(SymbolTableCollection &tables) {
+  return references(*this, tables);
+}
+LogicalResult AsyncWaitOp::verify() {
+  if (getSlot().empty() || getGeneration().empty())
+    return emitOpError("async_wait requires non-empty slot and generation");
+  return success();
+}
+LogicalResult AsyncWaitOp::verifySymbolUses(SymbolTableCollection &tables) {
+  return references(*this, tables);
+}
 
 #define METREON_CALLABLE_VERIFY(NAME) \
   LogicalResult NAME::verify() { \
@@ -296,6 +316,11 @@ LogicalResult DeviceIntrinsicOp::verify() {
   if (kind == "global_id") {
     if (getNumOperands() || getNumResults() != 1 || !getResult(0).getType().isIndex())
       return emitOpError("global_id requires no runtime operands and one index result");
+    return success();
+  }
+  if (kind == "barrier" || kind == "warp_barrier" || kind == "grid_barrier") {
+    if (getNumOperands() || getNumResults())
+      return emitOpError("device barrier intrinsic takes no operands and returns no results");
     return success();
   }
   if (kind != "load" && kind != "store") return emitOpError("unsupported device intrinsic");

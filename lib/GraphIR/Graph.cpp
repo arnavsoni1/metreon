@@ -34,16 +34,61 @@ const char *callableOperationKindName(CallableOperationKind kind) {
   case CallableOperationKind::IteratorHasNext: return "iterator_has_next";
   case CallableOperationKind::IteratorValue: return "iterator_value";
   case CallableOperationKind::IteratorAdvance: return "iterator_advance";
+  case CallableOperationKind::ChannelSend: return "channel_send";
+  case CallableOperationKind::ChannelReceive: return "channel_recv";
+  case CallableOperationKind::Offer: return "offer";
+  case CallableOperationKind::FairChoice: return "fair_choice";
+  case CallableOperationKind::ProgressMarker: return "progress_marker";
+  case CallableOperationKind::AsyncIssue: return "async_issue";
+  case CallableOperationKind::AsyncWait: return "async_wait";
   }
   throw std::logic_error("unknown callable operation kind");
+}
+
+bool isBehavioralOrAsyncOperation(CallableOperationKind kind) noexcept {
+  switch (kind) {
+  case CallableOperationKind::ChannelSend:
+  case CallableOperationKind::ChannelReceive:
+  case CallableOperationKind::Offer:
+  case CallableOperationKind::FairChoice:
+  case CallableOperationKind::ProgressMarker:
+  case CallableOperationKind::AsyncIssue:
+  case CallableOperationKind::AsyncWait:
+    return true;
+  default:
+    return false;
+  }
 }
 
 void walkCallableOperations(const std::vector<CallableOperation> &body,
     const std::function<void(const CallableOperation &)> &visit) {
   for (const auto &op : body) {
     visit(op);
-    for (const auto *children : {&op.initialization, &op.condition, &op.body, &op.alternative, &op.step})
+    for (const auto *children : {&op.initialization, &op.condition, &op.offerBranches, &op.body, &op.alternative, &op.step})
       walkCallableOperations(*children, visit);
+  }
+}
+
+void walkCallableOperationsWithContext(
+    const std::vector<CallableOperation> &body,
+    ContextMetadataRef inheritedRegionContext,
+    const std::function<void(const CallableOperation &,
+                             const ContextMetadataRef &)> &visit) {
+  for (const auto &op : body) {
+    const ContextMetadataRef effective =
+        op.kind == CallableOperationKind::ContextRegion
+            ? op.context
+            : (op.context ? op.context : inheritedRegionContext);
+    visit(op, effective);
+    const ContextMetadataRef childInherited =
+        op.kind == CallableOperationKind::ContextRegion
+            ? op.context
+            : inheritedRegionContext;
+    for (const auto *children :
+         {&op.initialization, &op.condition, &op.offerBranches, &op.body,
+          &op.alternative, &op.step}) {
+      walkCallableOperationsWithContext(*children, childInherited, visit);
+    }
   }
 }
 
@@ -52,7 +97,8 @@ bool hasStructuredControlFlow(const std::vector<CallableOperation> &body) {
   walkCallableOperations(body, [&](const auto &op) {
     if (op.kind == CallableOperationKind::If || op.kind == CallableOperationKind::Loop ||
         op.kind == CallableOperationKind::For || op.kind == CallableOperationKind::While ||
-        op.kind == CallableOperationKind::Until) result = true;
+        op.kind == CallableOperationKind::Until || op.kind == CallableOperationKind::Offer ||
+        op.kind == CallableOperationKind::FairChoice) result = true;
   });
   return result;
 }
@@ -712,16 +758,11 @@ std::string Module::print() const {
       std::map<CallableValueId, const CallableOperation *> operations;
       walkCallableOperations(callable.body(), [&](const auto &op) { operations.emplace(op.id, &op); });
       std::map<CallableValueId, ContextMetadataRef> effectiveContexts;
-      std::function<void(const std::vector<CallableOperation> &, ContextMetadataRef)> contexts;
-      contexts = [&](const auto &body, ContextMetadataRef ambient) {
-        for (const auto &op : body) {
-          auto effective = op.context ? op.context : ambient;
-          effectiveContexts.emplace(op.id, effective);
-          for (const auto *children : {&op.initialization, &op.condition, &op.body, &op.alternative, &op.step})
-            contexts(*children, effective);
-        }
-      };
-      contexts(callable.body(), callable.context());
+      walkCallableOperationsWithContext(
+          callable.body(), callable.context(),
+          [&](const auto &op, const auto &effective) {
+            effectiveContexts.emplace(op.id, effective ? effective : callable.context());
+          });
       const auto callablePrefix = prefix + std::to_string(index);
       const auto blockPrefix = "^" + callablePrefix + "bb";
       const auto operationPrefix = "#" + callablePrefix + "op";
@@ -795,6 +836,7 @@ std::string Module::print() const {
           output << "        graphir.cfg.cond_br " << valuePrefix << terminator.operands.at(0)
                  << " true(" << blockPrefix << terminator.successor.value() << ") false("
                  << blockPrefix << terminator.falseSuccessor.value() << ')';
+          if (!terminator.control.empty()) printAttributes(output, {{"control", terminator.control}});
           if (terminator.operation) output << " id(" << operationPrefix << *terminator.operation << ')';
         } else {
           output << "        graphir.cfg.return";

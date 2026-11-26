@@ -81,6 +81,7 @@ function(metreon_enable_warnings target)
 endfunction()
 
 add_library(metreon_frontend
+    lib/GraphIR/Behavioral.cpp
     lib/GraphIR/ControlFlow.cpp
     lib/GraphIR/Graph.cpp
     lib/GraphIR/Composition.cpp
@@ -97,6 +98,7 @@ add_library(metreon_frontend
     lib/Sema/CallableValidator.cpp
     lib/Sema/CompositionValidator.cpp
     lib/Verification/GPUProfile.cpp
+    lib/Verification/GPUOwnershipAndLoans.cpp
 )
 
 target_include_directories(metreon_frontend
@@ -123,7 +125,7 @@ if(METREON_ENABLE_MLIR)
         MLIRFuncToLLVM MLIRArithToLLVM MLIRControlFlowToLLVM MLIRMemRefToLLVM)
     metreon_enable_warnings(metreon_host_lowering)
     add_dependencies(metreon_mlir metreon_host_lowering)
-    add_library(metreon_gpu_lowering lib/MLIR/GPULowering.cpp)
+    add_library(metreon_gpu_lowering lib/MLIR/GPULowering.cpp lib/MLIR/GPUVerification.cpp)
     target_link_libraries(metreon_gpu_lowering PUBLIC metreon_scalar_lowering
         MLIRGPUDialect MLIRAffineDialect MLIRSCFDialect MLIRUBDialect
         MLIRControlFlowToSCF MLIRMemRefDialect MLIRTransforms)
@@ -131,7 +133,8 @@ if(METREON_ENABLE_MLIR)
     add_dependencies(metreon_mlir metreon_gpu_lowering)
     add_library(metreon_device_execution lib/MLIR/DeviceExecution.cpp lib/MLIR/NVVMBackend.cpp lib/MLIR/ROCDLBackend.cpp)
     target_include_directories(metreon_device_execution PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/include)
-    target_link_libraries(metreon_device_execution PUBLIC metreon_scalar_lowering
+    target_link_libraries(metreon_device_execution PUBLIC metreon_gpu_lowering
+        MLIRAffineToStandard MLIRSCFToControlFlow MLIRUBToLLVM
         MLIRGPUToNVVMTransforms MLIRFuncToLLVM MLIRArithToLLVM MLIRControlFlowToLLVM MLIRMemRefToLLVM
         MLIRNVVMToLLVMIRTranslation MLIRLLVMToLLVMIRTranslation MLIRBuiltinToLLVMIRTranslation MLIRTargetLLVMIRExport
         MLIRGPUToROCDLTransforms MLIRROCDLToLLVMIRTranslation LLVM)
@@ -227,6 +230,11 @@ if(BUILD_TESTING)
         metreon_enable_warnings(metreon_gpu_lowering_tests)
         add_test(NAME metreon.gpu.control_flow.import COMMAND metreon_gpu_lowering_tests
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/GPUControlFlow.mtr)
+        add_executable(metreon_gpu_mlir_verification_tests tests/GPUMLIRVerificationTests.cpp)
+        target_link_libraries(metreon_gpu_mlir_verification_tests PRIVATE metreon_aot MLIRParser)
+        metreon_enable_warnings(metreon_gpu_mlir_verification_tests)
+        add_test(NAME metreon.gpu.mlir_verification COMMAND metreon_gpu_mlir_verification_tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/examples/vector_add.mtr)
         add_executable(metreon_host_lowering_tests tests/HostLoweringTests.cpp)
         target_link_libraries(metreon_host_lowering_tests PRIVATE metreon_host_lowering MLIRParser)
         metreon_enable_warnings(metreon_host_lowering_tests)
@@ -307,6 +315,26 @@ if(BUILD_TESTING)
         COMMAND metreon_gpu_verification_profile_tests
             ${CMAKE_CURRENT_SOURCE_DIR}/examples/protocols_and_pipelines.mtr
             ${CMAKE_CURRENT_SOURCE_DIR}/examples/vector_add.mtr
+            ${CMAKE_CURRENT_SOURCE_DIR}/examples/contexts.mtr)
+
+    add_executable(metreon_gpu_behavioral_bridge_tests
+        tests/GPUBehavioralBridgeTests.cpp)
+    target_link_libraries(metreon_gpu_behavioral_bridge_tests
+        PRIVATE metreon_frontend)
+    metreon_enable_warnings(metreon_gpu_behavioral_bridge_tests)
+    add_test(NAME metreon.gpu.behavioral_bridge
+        COMMAND metreon_gpu_behavioral_bridge_tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/examples/vector_add.mtr)
+
+    add_executable(metreon_gpu_ownership_loan_tests
+        tests/GPUOwnershipAndLoanTests.cpp)
+    target_link_libraries(metreon_gpu_ownership_loan_tests
+        PRIVATE metreon_frontend)
+    metreon_enable_warnings(metreon_gpu_ownership_loan_tests)
+    add_test(NAME metreon.gpu.ownership_loans
+        COMMAND metreon_gpu_ownership_loan_tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/examples/vector_add.mtr
+            ${CMAKE_CURRENT_SOURCE_DIR}/examples/procedures.mtr
             ${CMAKE_CURRENT_SOURCE_DIR}/examples/contexts.mtr)
 
     if(NOT METREON_ENABLE_MLIR)

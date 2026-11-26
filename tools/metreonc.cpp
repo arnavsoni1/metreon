@@ -37,7 +37,7 @@ void printUsage(std::ostream &output) {
             "MLIR requires METREON_ENABLE_MLIR=ON; --emit=mlir preserves deferred bodies.\n"
             "--emit=llvm converts checked host scalar GraphIR CFGs to LLVM-dialect MLIR.\n"
             "--emit=gpu lowers checked GPU scalar control flow to affine/scf MLIR.\n"
-            "--context-only selects live device bodies and skips optional verification/optimization.\n"
+            "--context-only selects live device bodies while retaining GraphIR optimization passes.\n"
             "--emit=nvvm and --emit=ptx imply --context-only and preserve intermediate artifacts.\n"
             "Executable emission uses the context-only profile and writes only the linked binary.\n"
             "GPU code defaults to sm_80 (CUDA) or gfx900 (AMDGPU); --arch selects the AoT chip.\n"
@@ -185,7 +185,6 @@ int main(int argc, char **argv) {
   }
   if (architecture.empty()) architecture = gpuTarget == "amdgpu" ? "gfx900" : "sm_80";
   if (emitFormat == "exe" || emitFormat == "ptx" || emitFormat == "nvvm" || amdFormat) contextOnly = true;
-  if (contextOnly) optimize = false;
   if (contextOnly && emitFormat == "llvm") {
     std::cerr << "metreonc: --context-only currently supports GPU execution, not host LLVM emission\n";
     return 1;
