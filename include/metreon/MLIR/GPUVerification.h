@@ -1,5 +1,7 @@
 #pragma once
 
+#include "metreon/Verification/Behavioral.h"
+#include "metreon/Verification/GPUMemoryAccessProtocol.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Support/LogicalResult.h"
 
@@ -31,5 +33,26 @@ void promoteGPUStructuredLoopsAndBranches(::mlir::Operation *root);
 //    accesses, stale-generation completion reuse, asymmetric branch waits, and
 //    unawaited loop/exit transfers).
 ::mlir::LogicalResult verifyGPUContextHierarchyAndLoans(::mlir::ModuleOp module);
+
+// Enforces Phase GPU-3 static guarantees on structured `scf`/`affine` GPU MLIR:
+// 1. Hierarchical SIMT barrier-uniformity (`WorkgroupUniform < SubgroupUniform
+//    < LaneDivergent`), rejecting workgroup barriers under divergent control
+//    flow and subgroup collectives under lane-divergent control flow.
+// 2. Per-phase affine memory-access protocol extraction across two-level
+//    workgroup/subgroup synchronization epochs with symbolic loop barrier
+//    aligning across backedges.
+// 3. Pairwise symbolic thread data-race freedom (W-W and R-W) on global (AS 1)
+//    and workgroup-shared (AS 3) buffers, plus static/optional bounds checks.
+::mlir::LogicalResult verifyGPUBarrierUniformityAndAccessProtocols(
+    ::mlir::ModuleOp module,
+    const verification::GPUMemoryAccessProtocolOptions &options = {});
+
+// Enforces Phase GPU-4 bounded-queue protocol compatibility, slot conservation,
+// workgroup co-residency, and acquire/release publication scope sufficiency
+// directly on live Metreon MLIR `metreon.pipeline` / `metreon.protocol` /
+// `metreon.stage` declarations.
+::mlir::LogicalResult verifyGPUPipelineProtocols(
+    ::mlir::ModuleOp module,
+    const verification::GPUBoundedQueueOptions &options = {});
 
 } // namespace metreon

@@ -20,6 +20,7 @@ namespace {
 
 void verifyPipeline(const Module &module, const PipelineGraph &pipeline) {
   std::map<std::string, std::size_t> stages;
+  std::map<std::string, const CompositionDefinition *> edges;
   std::vector<const CompositionDefinition *> schedules, topologies;
   detail::Dependencies dependencies;
   for (const auto &member : pipeline.members) {
@@ -28,6 +29,9 @@ void verifyPipeline(const Module &module, const PipelineGraph &pipeline) {
     if (reference.kind == DefinitionKind::Stage) {
       stages.emplace(module.definitionName(reference), reference.index);
       dependencies[reference.index];
+    } else if (reference.kind == DefinitionKind::PipelineEdge) {
+      const auto &edgeDef = module.compositionDefinitions().at(reference.index);
+      edges.emplace(edgeDef.name, &edgeDef);
     } else if (reference.kind == DefinitionKind::Schedule) {
       schedules.push_back(&module.compositionDefinitions().at(reference.index));
     } else if (reference.kind == DefinitionKind::Topology) {
@@ -39,9 +43,19 @@ void verifyPipeline(const Module &module, const PipelineGraph &pipeline) {
     const auto found = stages.find(endpoint.substr(0, endpoint.find('.')));
     return found == stages.end() ? std::nullopt : std::optional{found->second};
   };
+  const auto isCreditSeededEdge = [&](const CompositionRecord &conn) {
+    const auto edgeIt = conn.attributes.find("edge");
+    if (edgeIt == conn.attributes.end()) return false;
+    const auto defIt = edges.find(edgeIt->second);
+    if (defIt == edges.end()) return false;
+    const auto seededIt = defIt->second->attributes.find("seeded_items");
+    if (seededIt == defIt->second->attributes.end()) return false;
+    return !seededIt->second.empty() && seededIt->second != "0";
+  };
   for (const auto *topology : topologies) {
     for (const auto &connection : topology->records) {
       if (connection.kind != "connection") continue;
+      if (isCreditSeededEdge(connection)) continue;
       const auto source = endpointStage(connection.attributes.at("source"));
       const auto target = endpointStage(connection.attributes.at("target"));
       if (source && target) dependencies.at(*source).insert(*target);

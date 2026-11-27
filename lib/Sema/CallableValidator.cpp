@@ -205,7 +205,9 @@ CallableAnalysis Validator::run() {
   auto add = [&](const auto &declarations, bool isKernel) {
     for (const auto &declaration : declarations) {
       const std::string name = declaration.name.str();
-      if (name == "gpu::global_id" || name == "gpu::load" || name == "gpu::store" ||
+      if (name == "gpu::global_id" || name == "gpu::thread_id" || name == "gpu::block_id" ||
+          name == "gpu::block_dim" || name == "gpu::barrier" || name == "gpu::warp_barrier" ||
+          name == "gpu::load" || name == "gpu::store" ||
           name.starts_with("gpu::launch::") || name == "gpu::alloc" || name == "gpu::free" ||
           name == "gpu::upload" || name == "gpu::download" || name == "gpu::wait" ||
           name == "host::alloc" || name == "host::free" || name == "host::load" ||
@@ -601,7 +603,10 @@ ast::ValueType Validator::call(const ast::Expression &expr) {
       name == "gpu::upload" || name == "gpu::download" || name == "gpu::wait" ||
       name == "host::alloc" || name == "host::free" || name == "host::load" ||
       name == "host::store" || name == "host::print_f32") return hostBuiltin(expr);
-  if (expr.name.str() == "gpu::global_id" || expr.name.str() == "gpu::load" || expr.name.str() == "gpu::store")
+  if (expr.name.str() == "gpu::global_id" || expr.name.str() == "gpu::thread_id" ||
+      expr.name.str() == "gpu::block_id" || expr.name.str() == "gpu::block_dim" ||
+      expr.name.str() == "gpu::barrier" || expr.name.str() == "gpu::warp_barrier" ||
+      expr.name.str() == "gpu::load" || expr.name.str() == "gpu::store")
     return gpuBuiltin(expr);
   const auto transition = transitions_.find(expr.name.str());
   if (transition != transitions_.end()) {
@@ -652,16 +657,26 @@ ast::ValueType Validator::call(const ast::Expression &expr) {
 
 ast::ValueType Validator::gpuBuiltin(const ast::Expression &expr) {
   const auto name = expr.name.str();
-  const auto arity = name == "gpu::global_id" ? 1u : name == "gpu::load" ? 3u : 4u;
+  const bool indexQuery =
+      name == "gpu::global_id" || name == "gpu::thread_id" ||
+      name == "gpu::block_id" || name == "gpu::block_dim";
+  const bool syncOp = name == "gpu::barrier" || name == "gpu::warp_barrier";
+  const auto arity = (indexQuery || syncOp) ? 1u : name == "gpu::load" ? 3u : 4u;
   if (expr.arguments.size() != arity) fail("call_arity", "wrong argument count for `" + name + "`", expr.location);
   contextArgument(expr.arguments[0]);
   if (!context_ || context_->name.components.empty() || context_->name.components.front() != "Gpu" ||
       context_->name.components.back() == "Loop")
     fail("gpu_execution_context", "GPU intrinsics require a Gpu execution context", expr.location);
   std::vector<ast::TypeReference> effects;
-  if (name != "gpu::global_id") {
+  if (syncOp) {
+    const std::string cap = name == "gpu::barrier" ? "gpu_barrier" : "gpu_warp_barrier";
+    effects.push_back(simpleType(cap, expr.location).reference);
+    requireCapabilities(effects, context_, expr.location);
+    requireEffects(effects, expr.location);
+  } else if (!indexQuery) {
     const auto span = expression(expr.arguments[1]);
-    if (span.str() != "gpu::span<f32>") fail("type_mismatch", "GPU memory intrinsics require gpu::span<f32>", expr.arguments[1].location);
+    if (span.str() != "gpu::span<f32>" && span.str() != "gpu::shared_span<f32>")
+      fail("type_mismatch", "GPU memory intrinsics require gpu::span<f32> or gpu::shared_span<f32>", expr.arguments[1].location);
     match(expr.arguments[2], expression(expr.arguments[2]), simpleType("index", expr.location));
     if (name == "gpu::store") match(expr.arguments[3], expression(expr.arguments[3]), simpleType("f32", expr.location));
     effects.push_back(simpleType(name == "gpu::load" ? "gpu_load" : "gpu_store", expr.location).reference);
@@ -673,7 +688,7 @@ ast::ValueType Validator::gpuBuiltin(const ast::Expression &expr) {
   info.calleeKind = "gpu_builtin";
   info.calleeName = name;
   info.effects = std::move(effects);
-  return simpleType(name == "gpu::global_id" ? "index" : name == "gpu::load" ? "f32" : "void", expr.location);
+  return simpleType(indexQuery ? "index" : name == "gpu::load" ? "f32" : "void", expr.location);
 }
 
 ast::ValueType Validator::hostBuiltin(const ast::Expression &expr) {
@@ -954,7 +969,7 @@ void validateValueType(const ast::Module &module, const ast::ValueType &type,
       fail("type_arity", "wrong generic arity for `" + name + "`", type.location);
     return;
   }
-  if (name == "gpu::span" || name == "host::span") {
+  if (name == "gpu::span" || name == "gpu::shared_span" || name == "host::span") {
     if (type.ownership != ast::OwnershipQualifier::None || reference.arguments.size() != 1 || reference.arguments[0].str() != "f32")
       fail("span_type", "executable spans support unowned f32 elements only", type.location);
     return;

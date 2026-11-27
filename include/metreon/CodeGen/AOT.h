@@ -10,6 +10,7 @@ struct AOTOptions {
   std::string architecture = "sm_80";
   GPUBackend backend = GPUBackend::CUDA;
 };
+std::string assembleCUDACodeObject(const std::string &ptx, const std::string &architecture);
 std::string linkAMDGPUCodeObject(const std::string &object);
 // Emit and link a native program. This API never initializes a GPU or executes
 // the generated program; GPU code is assembled and embedded ahead of time.

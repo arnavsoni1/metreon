@@ -189,7 +189,10 @@ void validatePipeline(const ast::Module &module, const ast::PipelineDeclaration 
     const auto protocol = protocols.find(edge.type.arguments[0].str());
     if (protocol == protocols.end())
       fail("unknown_channel_protocol", "unknown channel protocol `" + edge.type.arguments[0].str() + "`", edge.location);
-    const auto props = properties(edge.properties, {"initial", "capacity", "storage", "scope", "delivery", "backpressure"});
+    const auto props = properties(
+        edge.properties,
+        {"initial", "capacity", "seeded_items", "storage", "scope", "delivery",
+         "backpressure", "publication"});
     const auto &initial = required(props, "initial", edge.location);
     const auto state = named(initial);
     const auto found = std::find_if(protocol->second->states.begin(), protocol->second->states.end(),
@@ -197,9 +200,24 @@ void validatePipeline(const ast::Module &module, const ast::PipelineDeclaration 
     if (found == protocol->second->states.end())
       fail("unknown_protocol_state", "unknown channel initial state `" + state + "`", initial.location);
     positiveProperty(required(props, "capacity", edge.location), "invalid_capacity");
+    if (props.contains("seeded_items")) {
+      const auto *lit =
+          std::get_if<ast::LiteralInitializer>(&props.at("seeded_items")->value);
+      if (!lit)
+        fail("invalid_seeded_items",
+             "property requires a nonnegative integer",
+             props.at("seeded_items")->location);
+      (void)integer(*lit, false, "invalid_seeded_items");
+    }
     if (props.contains("storage")) choice(*props.at("storage"), {"gpu::shared", "gpu::global", "host::pinned"});
     if (props.contains("scope")) choice(*props.at("scope"), {"thread", "warp", "block", "cluster", "device"});
     if (props.contains("backpressure")) choice(*props.at("backpressure"), {"cooperative", "blocking"});
+    if (props.contains("publication")) {
+      choice(*props.at("publication"),
+             {"relaxed", "acquire_workgroup", "release_workgroup",
+              "acq_rel_workgroup", "acquire_device", "release_device",
+              "acq_rel_device"});
+    }
     if (props.contains("delivery")) {
       const auto &property = *props.at("delivery");
       named(property);
@@ -283,7 +301,9 @@ void validatePipeline(const ast::Module &module, const ast::PipelineDeclaration 
       }
       const auto props = properties(worker.properties, {"blocks", "residency"});
       positiveProperty(required(props, "blocks", worker.location), "invalid_blocks");
-      if (props.contains("residency")) choice(*props.at("residency"), {"persistent", "transient"});
+      if (props.contains("residency"))
+        choice(*props.at("residency"),
+               {"persistent", "transient", "cooperative"});
     }
     std::unordered_set<std::string> placements;
     for (const auto &placement : schedule.placements) {

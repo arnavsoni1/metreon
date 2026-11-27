@@ -1,6 +1,8 @@
 #include "metreon/MLIR/GPUVerification.h"
 
 #include "metreon/MLIR/Dialect.h"
+#include "metreon/Verification/Behavioral.h"
+#include "metreon/Verification/GPUMemoryAccessProtocol.h"
 #include "metreon/Verification/GPUOwnershipAndLoans.h"
 #include "metreon/Verification/GPUProfile.h"
 
@@ -14,6 +16,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRefMemorySlot.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
+#include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
@@ -1557,6 +1560,1985 @@ LogicalResult structureGPUFunctionControlFlow(ModuleOp module,
 
 LogicalResult verifyGPUContextHierarchyAndLoans(ModuleOp module) {
   return MLIRGPUVerifier(module).run();
+}
+
+namespace {
+
+using verification::addExpr;
+using verification::AffineSymbolicExpr;
+using verification::divExpr;
+using verification::GPUMemoryAccessProtocolOptions;
+using verification::GPUProtocolReport;
+using verification::joinUniformity;
+using verification::MemoryAccessMode;
+using verification::mulExpr;
+using verification::negExpr;
+using verification::ProtocolStmt;
+using verification::remExpr;
+using verification::SIMTUniformity;
+using verification::subExpr;
+using verification::SymbolicGuard;
+using verification::SymbolicVar;
+using verification::SymbolicVarKind;
+
+SourceLocation mlirLocToSourceLoc(Location loc) {
+  if (auto flc = dyn_cast<FileLineColLoc>(loc)) {
+    return SourceLocation{flc.getLine(), flc.getColumn()};
+  }
+  return SourceLocation{0, 0};
+}
+
+struct GuardPair {
+  SymbolicGuard whenTrue;
+  SymbolicGuard whenFalse;
+};
+
+struct MLIRBufferDesc {
+  std::string name;
+  GPUAddressSpace space = GPUAddressSpace::GlobalDevice;
+  std::optional<std::int64_t> staticExtent;
+  std::optional<std::string> dynamicExtentParam;
+  SmallVector<std::int64_t, 4> staticShape;
+};
+
+Value unwrapMemRefBase(Value v) {
+  while (Operation *def = v.getDefiningOp()) {
+    if (isa<memref::CastOp, memref::ReinterpretCastOp,
+            UnrealizedConversionCastOp>(def) &&
+        def->getNumOperands() == 1) {
+      v = def->getOperand(0);
+      continue;
+    }
+    break;
+  }
+  return v;
+}
+
+class MLIRAccessProtocolVerifier {
+public:
+  MLIRAccessProtocolVerifier(ModuleOp root,
+                             const GPUMemoryAccessProtocolOptions &options)
+      : root_(root), options_(options) {}
+
+  LogicalResult run() {
+    indexModuleCallables();
+
+    bool foundGPUModule = false;
+    root_.walk([&](gpu::GPUModuleOp gpuMod) {
+      foundGPUModule = true;
+      verifyGPUModule(gpuMod);
+    });
+
+    if (!foundGPUModule) {
+      verifyStandaloneGPUFunctions();
+    }
+
+    return success(valid_);
+  }
+
+private:
+  struct Env {
+    llvm::DenseMap<Value, AffineSymbolicExpr> exprs;
+    llvm::DenseMap<Value, SIMTUniformity> uniformity;
+    llvm::DenseSet<Value> controlTainted;
+    llvm::DenseMap<Value, GuardPair> guards;
+    llvm::DenseMap<Value, MLIRBufferDesc> buffers;
+    llvm::DenseMap<Value, AffineSymbolicExpr> slotExprs;
+    llvm::DenseMap<Value, SIMTUniformity> slotUniformity;
+    llvm::DenseMap<Value, GuardPair> slotGuards;
+    std::map<std::string, SIMTUniformity> loopVarUniformity;
+  };
+
+  ModuleOp root_;
+  GPUMemoryAccessProtocolOptions options_;
+  bool valid_ = true;
+  unsigned nextLoopId_ = 0;
+  unsigned nextAnonBufId_ = 0;
+  llvm::DenseMap<Operation *, Operation *> bodyToContract_;
+  std::map<std::string, func::FuncOp> helperFuncs_;
+  std::set<std::string> activeCallStack_;
+  std::map<std::pair<unsigned, unsigned>, Operation *> locToOp_;
+
+  void recordOpLoc(Operation *op) {
+    const SourceLocation sl = mlirLocToSourceLoc(op->getLoc());
+    if (sl.line != 0 || sl.column != 0) {
+      locToOp_.try_emplace({sl.line, sl.column}, op);
+    }
+  }
+
+  void indexModuleCallables() {
+    root_.walk([&](Operation *op) {
+      if (!isa<KernelOp, ProcedureOp, StageOp>(op)) return;
+      if (auto bodyRef = op->getAttrOfType<SymbolRefAttr>("body_ref")) {
+        if (Operation *body = lookupSymbolInAncestors(op, bodyRef))
+          bodyToContract_[body] = op;
+      }
+      if (auto devBody =
+              op->getAttrOfType<SymbolRefAttr>("metreon.device_body")) {
+        if (Operation *body = lookupSymbolInAncestors(op, devBody))
+          bodyToContract_[body] = op;
+      }
+    });
+  }
+
+  bool isGPUFuncCandidate(func::FuncOp fn) {
+    if (fn.isExternal()) return false;
+    if (Operation *contract = bodyToContract_.lookup(fn)) {
+      auto dom = contract->getAttrOfType<StringAttr>("execution_domain");
+      if (dom) return dom.getValue() == "Gpu";
+    }
+    if (auto ctxRef = fn->getAttrOfType<SymbolRefAttr>("metreon.context")) {
+      if (ContextOp ctx = resolveContextOp(fn, ctxRef)) {
+        if (auto nom = ctx.getNominalType().getAs<StringAttr>("name")) {
+          if (nom.getValue().starts_with("Host::")) return false;
+          if (nom.getValue().starts_with("Gpu::")) return true;
+        }
+      }
+    }
+    bool hasGPUConstruct = false;
+    fn.walk([&](Operation *op) {
+      if (op->getName().getDialectNamespace() == "gpu" ||
+          isa<DeviceIntrinsicOp>(op)) {
+        hasGPUConstruct = true;
+        return WalkResult::interrupt();
+      }
+      for (Type t : op->getOperandTypes()) {
+        if (auto mt = dyn_cast<MemRefType>(t)) {
+          const auto sp = memrefAddressSpace(mt);
+          if (sp && (*sp == GPUAddressSpace::GlobalDevice ||
+                     *sp == GPUAddressSpace::WorkgroupShared)) {
+            hasGPUConstruct = true;
+            return WalkResult::interrupt();
+          }
+        }
+      }
+      return WalkResult::advance();
+    });
+    return hasGPUConstruct;
+  }
+
+  void verifyGPUModule(gpu::GPUModuleOp gpuMod) {
+    helperFuncs_.clear();
+    std::set<std::string> calledHelpers;
+    for (func::FuncOp fn : gpuMod.getOps<func::FuncOp>()) {
+      if (!fn.isExternal()) helperFuncs_[fn.getSymName().str()] = fn;
+    }
+    gpuMod.walk([&](func::CallOp call) {
+      calledHelpers.insert(call.getCallee().str());
+    });
+
+    for (gpu::GPUFuncOp kernel : gpuMod.getOps<gpu::GPUFuncOp>()) {
+      if (kernel.isDeclaration()) continue;
+      verifyCallableRoot(kernel, kernel.getName().str(), kernel.getBody(),
+                         kernel.getFunctionType().getNumInputs(),
+                         kernel.getWorkgroupAttributions());
+    }
+
+    // Also verify uncalled root GPU procedures when a gpu.module has no kernels
+    // (or standalone root procedures).
+    for (func::FuncOp fn : gpuMod.getOps<func::FuncOp>()) {
+      if (fn.isExternal()) continue;
+      if (calledHelpers.contains(fn.getSymName().str())) continue;
+      verifyCallableRoot(fn, fn.getSymName().str(), fn.getBody(),
+                         fn.getFunctionType().getNumInputs(), {});
+    }
+  }
+
+  void verifyStandaloneGPUFunctions() {
+    helperFuncs_.clear();
+    SmallVector<func::FuncOp> candidates;
+    std::set<std::string> calledHelpers;
+
+    root_.walk([&](func::FuncOp fn) {
+      if (!fn.isExternal()) helperFuncs_[fn.getSymName().str()] = fn;
+      if (isGPUFuncCandidate(fn)) candidates.push_back(fn);
+    });
+    for (func::FuncOp fn : candidates) {
+      fn.walk([&](func::CallOp call) {
+        calledHelpers.insert(call.getCallee().str());
+      });
+    }
+
+    for (func::FuncOp fn : candidates) {
+      Operation *contract = bodyToContract_.lookup(fn);
+      const bool isKernel = isa_and_nonnull<KernelOp>(contract);
+      if (!isKernel && calledHelpers.contains(fn.getSymName().str())) continue;
+      verifyCallableRoot(fn, fn.getSymName().str(), fn.getBody(),
+                         fn.getFunctionType().getNumInputs(), {});
+    }
+  }
+
+  void verifyCallableRoot(Operation *callableOp, const std::string &name,
+                          Region &body, unsigned numInputs,
+                          ArrayRef<BlockArgument> workgroupAttrs) {
+    if (body.empty() || !body.hasOneBlock()) return;
+    locToOp_.clear();
+    activeCallStack_.clear();
+    activeCallStack_.insert(name);
+
+    Env env;
+    Operation *contract = bodyToContract_.lookup(callableOp);
+    ArrayAttr paramAttrs =
+        contract ? contract->getAttrOfType<ArrayAttr>("parameter_attrs")
+                 : ArrayAttr{};
+
+    auto paramNameFor = [&](unsigned idx) -> std::string {
+      if (paramAttrs && idx < paramAttrs.size()) {
+        if (auto dict = dyn_cast<DictionaryAttr>(paramAttrs[idx])) {
+          if (auto nm = dict.getAs<StringAttr>("name"))
+            if (!nm.getValue().empty()) return nm.getValue().str();
+        }
+      }
+      return "arg" + std::to_string(idx);
+    };
+
+    Block &entry = body.front();
+    std::vector<std::string> indexParams;
+    for (unsigned i = 0; i < numInputs && i < entry.getNumArguments(); ++i) {
+      BlockArgument arg = entry.getArgument(i);
+      if (arg.getType().isIndex()) indexParams.push_back(paramNameFor(i));
+    }
+    const std::optional<std::string> inferredDynExtent =
+        indexParams.size() == 1 ? std::optional<std::string>(indexParams.front())
+                                : std::nullopt;
+
+    for (unsigned i = 0; i < numInputs && i < entry.getNumArguments(); ++i) {
+      BlockArgument arg = entry.getArgument(i);
+      const std::string pName = paramNameFor(i);
+      if (auto memType = dyn_cast<MemRefType>(arg.getType())) {
+        if (auto desc = buildBufferDesc(pName, memType, inferredDynExtent)) {
+          env.buffers[arg] = *desc;
+        }
+      } else if (isa<IndexType, IntegerType, FloatType>(arg.getType())) {
+        env.exprs[arg] =
+            AffineSymbolicExpr::makeVar(SymbolicVarKind::ScalarParam, pName);
+        env.uniformity[arg] = SIMTUniformity::WorkgroupUniform;
+      }
+    }
+
+    for (auto [idx, wgArg] : llvm::enumerate(workgroupAttrs)) {
+      if (auto memType = dyn_cast<MemRefType>(wgArg.getType())) {
+        if (auto desc = buildBufferDesc("wg_attr_" + std::to_string(idx),
+                                        memType, std::nullopt)) {
+          env.buffers[wgArg] = *desc;
+        }
+      }
+    }
+
+    std::vector<ProtocolStmt> stmts;
+    extractBlock(entry, SIMTUniformity::WorkgroupUniform, env, stmts, nullptr);
+    ProtocolStmt rootStmt = ProtocolStmt::makeSequence(
+        std::move(stmts), mlirLocToSourceLoc(callableOp->getLoc()));
+
+    GPUProtocolReport report;
+    verification::verifyKernelAccessProtocol(name, rootStmt, options_, report);
+    for (const auto &v : report.violations) {
+      Operation *diagAnchor = callableOp;
+      auto it = locToOp_.find({v.location.line, v.location.column});
+      if (it != locToOp_.end() && it->second != nullptr) diagAnchor = it->second;
+      diagAnchor->emitError("[" + v.code + "] " + v.message);
+      valid_ = false;
+    }
+  }
+
+  std::optional<MLIRBufferDesc>
+  buildBufferDesc(std::string name, MemRefType memType,
+                  std::optional<std::string> dynExtent) {
+    const auto space = memrefAddressSpace(memType);
+    if (!space || (*space != GPUAddressSpace::GlobalDevice &&
+                   *space != GPUAddressSpace::WorkgroupShared)) {
+      return std::nullopt;
+    }
+    MLIRBufferDesc desc;
+    desc.name = std::move(name);
+    desc.space = *space;
+    if (memType.getRank() >= 1) {
+      bool allStatic = true;
+      std::int64_t prod = 1;
+      for (std::int64_t d = 0; d < memType.getRank(); ++d) {
+        const std::int64_t dim = memType.getDimSize(d);
+        desc.staticShape.push_back(dim);
+        if (memType.isDynamicDim(d)) allStatic = false;
+        else prod *= dim;
+      }
+      if (allStatic) desc.staticExtent = prod;
+      else if (*space == GPUAddressSpace::GlobalDevice &&
+               memType.getRank() == 1 && dynExtent) {
+        desc.dynamicExtentParam = std::move(dynExtent);
+      }
+    }
+    return desc;
+  }
+
+  std::optional<MLIRBufferDesc> resolveBuffer(Value rawVal, MemRefType memType,
+                                              Env &env) {
+    Value base = unwrapMemRefBase(rawVal);
+    auto it = env.buffers.find(base);
+    if (it != env.buffers.end()) return it->second;
+
+    if (memType.getRank() == 0 &&
+        isa_and_nonnull<memref::AllocaOp>(base.getDefiningOp())) {
+      return std::nullopt;
+    }
+    std::string bufName;
+    if (auto glob = base.getDefiningOp<memref::GetGlobalOp>()) {
+      bufName = "@" + glob.getName().str();
+    } else {
+      bufName = "shared_buf_" + std::to_string(nextAnonBufId_++);
+    }
+    auto desc = buildBufferDesc(std::move(bufName), memType, std::nullopt);
+    if (desc) env.buffers[base] = *desc;
+    return desc;
+  }
+
+  SIMTUniformity valUniformity(Value v, const Env &env) const {
+    auto it = env.uniformity.find(v);
+    return it != env.uniformity.end() ? it->second
+                                      : SIMTUniformity::WorkgroupUniform;
+  }
+
+  AffineSymbolicExpr valExpr(Value v, const Env &env) const {
+    auto it = env.exprs.find(v);
+    return it != env.exprs.end() ? it->second : AffineSymbolicExpr::nonAffine();
+  }
+
+  GuardPair valGuard(Value v, const Env &env) const {
+    auto it = env.guards.find(v);
+    return it != env.guards.end() ? it->second : GuardPair{};
+  }
+
+  SIMTUniformity deriveExprUniformity(const AffineSymbolicExpr &e,
+                                      const Env &env,
+                                      SIMTUniformity fallback) const {
+    if (!e.isAffine || e.modulus != 0) return fallback;
+    SIMTUniformity u = SIMTUniformity::WorkgroupUniform;
+    for (const auto &[var, coeff] : e.terms) {
+      if (coeff == 0) continue;
+      switch (var.kind) {
+      case SymbolicVarKind::ThreadIdX:
+      case SymbolicVarKind::ThreadIdY:
+      case SymbolicVarKind::ThreadIdZ:
+      case SymbolicVarKind::LaneId:
+        u = joinUniformity(u, SIMTUniformity::LaneDivergent);
+        break;
+      case SymbolicVarKind::WarpId:
+        u = joinUniformity(u, SIMTUniformity::SubgroupUniform);
+        break;
+      case SymbolicVarKind::LoopVar: {
+        auto it = env.loopVarUniformity.find(var.name);
+        if (it != env.loopVarUniformity.end())
+          u = joinUniformity(u, it->second);
+        break;
+      }
+      default:
+        break;
+      }
+    }
+    return u;
+  }
+
+  AffineSymbolicExpr linearizeIndices(ArrayRef<AffineSymbolicExpr> indices,
+                                      const MLIRBufferDesc &buf) const {
+    if (indices.empty()) return AffineSymbolicExpr::makeConstant(0);
+    if (indices.size() == 1) return indices.front();
+    if (indices.size() != buf.staticShape.size())
+      return AffineSymbolicExpr::nonAffine();
+    AffineSymbolicExpr acc = indices.front();
+    for (std::size_t d = 1; d < indices.size(); ++d) {
+      if (buf.staticShape[d] < 0) return AffineSymbolicExpr::nonAffine();
+      acc = addExpr(
+          mulExpr(acc, AffineSymbolicExpr::makeConstant(buf.staticShape[d]),
+                  options_.subgroupSize),
+          indices[d]);
+    }
+    return acc;
+  }
+
+  std::pair<AffineSymbolicExpr, SIMTUniformity>
+  evalAffineExpr(AffineExpr expr, OperandRange dims, OperandRange syms,
+                 const Env &env) const {
+    if (auto cst = dyn_cast<AffineConstantExpr>(expr)) {
+      return {AffineSymbolicExpr::makeConstant(cst.getValue()),
+              SIMTUniformity::WorkgroupUniform};
+    }
+    if (auto dim = dyn_cast<AffineDimExpr>(expr)) {
+      if (dim.getPosition() < dims.size()) {
+        Value v = dims[dim.getPosition()];
+        return {valExpr(v, env), valUniformity(v, env)};
+      }
+      return {AffineSymbolicExpr::nonAffine(), SIMTUniformity::LaneDivergent};
+    }
+    if (auto sym = dyn_cast<AffineSymbolExpr>(expr)) {
+      if (sym.getPosition() < syms.size()) {
+        Value v = syms[sym.getPosition()];
+        return {valExpr(v, env), valUniformity(v, env)};
+      }
+      return {AffineSymbolicExpr::nonAffine(), SIMTUniformity::LaneDivergent};
+    }
+    if (auto bin = dyn_cast<AffineBinaryOpExpr>(expr)) {
+      const auto [lE, lU] = evalAffineExpr(bin.getLHS(), dims, syms, env);
+      const auto [rE, rU] = evalAffineExpr(bin.getRHS(), dims, syms, env);
+      const SIMTUniformity joined = joinUniformity(lU, rU);
+      switch (bin.getKind()) {
+      case AffineExprKind::Add:
+        return {addExpr(lE, rE), joined};
+      case AffineExprKind::Mul:
+        return {mulExpr(lE, rE, options_.subgroupSize),
+                (lE.isConstant() && lE.constant == 0) ||
+                        (rE.isConstant() && rE.constant == 0)
+                    ? SIMTUniformity::WorkgroupUniform
+                    : joined};
+      case AffineExprKind::FloorDiv: {
+        const auto dE = divExpr(lE, rE, options_.subgroupSize);
+        return {dE, deriveExprUniformity(dE, env, joined)};
+      }
+      case AffineExprKind::Mod:
+        return {remExpr(lE, rE, options_.subgroupSize), joined};
+      case AffineExprKind::CeilDiv:
+        return {AffineSymbolicExpr::nonAffine(), joined};
+      default:
+        break;
+      }
+    }
+    return {AffineSymbolicExpr::nonAffine(), SIMTUniformity::LaneDivergent};
+  }
+
+  void mergeBranchSlots(SIMTUniformity branchPC, const Env &preEnv,
+                        const Env &thenEnv, const Env &elseEnv, Env &outEnv) {
+    llvm::DenseSet<Value> slots;
+    for (const auto &kv : preEnv.slotUniformity) slots.insert(kv.first);
+    for (const auto &kv : thenEnv.slotUniformity) slots.insert(kv.first);
+    for (const auto &kv : elseEnv.slotUniformity) slots.insert(kv.first);
+
+    for (Value s : slots) {
+      const auto tE = thenEnv.slotExprs.lookup(s);
+      const auto eE = elseEnv.slotExprs.lookup(s);
+      const auto pE = preEnv.slotExprs.lookup(s);
+      const SIMTUniformity tU = thenEnv.slotUniformity.lookup(s);
+      const SIMTUniformity eU = elseEnv.slotUniformity.lookup(s);
+      const bool sameUnchanged =
+          tE.isAffine && eE.isAffine && pE.isAffine &&
+          tE.constant == pE.constant && eE.constant == pE.constant &&
+          tE.terms == pE.terms && eE.terms == pE.terms &&
+          tE.modulus == pE.modulus && eE.modulus == pE.modulus &&
+          tU == preEnv.slotUniformity.lookup(s) &&
+          eU == preEnv.slotUniformity.lookup(s);
+      if (!sameUnchanged) {
+        outEnv.slotUniformity[s] =
+            joinUniformity(branchPC, joinUniformity(tU, eU));
+        outEnv.slotExprs[s] = AffineSymbolicExpr::nonAffine();
+        outEnv.slotGuards.erase(s);
+      }
+    }
+  }
+
+  struct CallReturnSummary {
+    AffineSymbolicExpr expr = AffineSymbolicExpr::nonAffine();
+    SIMTUniformity uniformity = SIMTUniformity::WorkgroupUniform;
+    bool seen = false;
+  };
+
+  void extractBlock(Block &block, SIMTUniformity pcUniformity, Env &env,
+                    std::vector<ProtocolStmt> &out,
+                    CallReturnSummary *retSummary) {
+    for (Operation &opRef : block) {
+      Operation *op = &opRef;
+      recordOpLoc(op);
+      const SourceLocation loc = mlirLocToSourceLoc(op->getLoc());
+
+      if (isa<arith::ConstantOp>(op)) {
+        Value res = op->getResult(0);
+        env.uniformity[res] = SIMTUniformity::WorkgroupUniform;
+        IntegerAttr intAttr;
+        if (matchPattern(op, m_Constant(&intAttr))) {
+          if (intAttr.getType().isInteger(1)) {
+            const bool bv = intAttr.getValue().getBoolValue();
+            env.exprs[res] = AffineSymbolicExpr::makeConstant(bv ? 1 : 0);
+            GuardPair gp;
+            if (bv) gp.whenFalse.contradiction = true;
+            else gp.whenTrue.contradiction = true;
+            env.guards[res] = std::move(gp);
+          } else if (intAttr.getValue().getBitWidth() <= 64) {
+            env.exprs[res] = AffineSymbolicExpr::makeConstant(
+                intAttr.getValue().getSExtValue());
+          } else {
+            env.exprs[res] = AffineSymbolicExpr::nonAffine();
+          }
+        } else {
+          env.exprs[res] = AffineSymbolicExpr::nonAffine();
+        }
+        continue;
+      }
+
+      if (auto tid = dyn_cast<gpu::ThreadIdOp>(op)) {
+        SymbolicVarKind vk = SymbolicVarKind::ThreadIdX;
+        if (tid.getDimension() == gpu::Dimension::y)
+          vk = SymbolicVarKind::ThreadIdY;
+        else if (tid.getDimension() == gpu::Dimension::z)
+          vk = SymbolicVarKind::ThreadIdZ;
+        env.exprs[tid.getResult()] = AffineSymbolicExpr::makeVar(vk);
+        env.uniformity[tid.getResult()] = SIMTUniformity::LaneDivergent;
+        continue;
+      }
+
+      if (auto bid = dyn_cast<gpu::BlockIdOp>(op)) {
+        SymbolicVarKind vk = SymbolicVarKind::BlockIdX;
+        if (bid.getDimension() == gpu::Dimension::y)
+          vk = SymbolicVarKind::BlockIdY;
+        else if (bid.getDimension() == gpu::Dimension::z)
+          vk = SymbolicVarKind::BlockIdZ;
+        env.exprs[bid.getResult()] = AffineSymbolicExpr::makeVar(vk);
+        env.uniformity[bid.getResult()] = SIMTUniformity::WorkgroupUniform;
+        continue;
+      }
+
+      if (auto bdim = dyn_cast<gpu::BlockDimOp>(op)) {
+        SymbolicVarKind vk = SymbolicVarKind::BlockDimX;
+        if (bdim.getDimension() == gpu::Dimension::y)
+          vk = SymbolicVarKind::BlockDimY;
+        else if (bdim.getDimension() == gpu::Dimension::z)
+          vk = SymbolicVarKind::BlockDimZ;
+        env.exprs[bdim.getResult()] = AffineSymbolicExpr::makeVar(vk);
+        env.uniformity[bdim.getResult()] = SIMTUniformity::WorkgroupUniform;
+        continue;
+      }
+
+      if (auto sgId = dyn_cast<gpu::SubgroupIdOp>(op)) {
+        env.exprs[sgId.getResult()] =
+            AffineSymbolicExpr::makeVar(SymbolicVarKind::WarpId);
+        env.uniformity[sgId.getResult()] = SIMTUniformity::SubgroupUniform;
+        continue;
+      }
+
+      if (auto laneId = dyn_cast<gpu::LaneIdOp>(op)) {
+        env.exprs[laneId.getResult()] =
+            AffineSymbolicExpr::makeVar(SymbolicVarKind::LaneId);
+        env.uniformity[laneId.getResult()] = SIMTUniformity::LaneDivergent;
+        continue;
+      }
+
+      if (isa<gpu::BarrierOp>(op)) {
+        out.push_back(ProtocolStmt::makeWorkgroupBarrier(pcUniformity, loc));
+        continue;
+      }
+
+      if (auto allRed = dyn_cast<gpu::AllReduceOp>(op)) {
+        out.push_back(ProtocolStmt::makeWorkgroupBarrier(pcUniformity, loc));
+        env.uniformity[allRed.getResult()] = SIMTUniformity::WorkgroupUniform;
+        env.exprs[allRed.getResult()] = AffineSymbolicExpr::nonAffine();
+        continue;
+      }
+
+      if (auto subRed = dyn_cast<gpu::SubgroupReduceOp>(op)) {
+        out.push_back(ProtocolStmt::makeSubgroupBarrier(
+            pcUniformity, "gpu.subgroup_reduce", loc));
+        env.uniformity[subRed.getResult()] = SIMTUniformity::SubgroupUniform;
+        env.exprs[subRed.getResult()] = AffineSymbolicExpr::nonAffine();
+        continue;
+      }
+
+      if (auto shfl = dyn_cast<gpu::ShuffleOp>(op)) {
+        out.push_back(
+            ProtocolStmt::makeSubgroupBarrier(pcUniformity, "gpu.shuffle", loc));
+        env.uniformity[shfl.getShuffleResult()] = SIMTUniformity::LaneDivergent;
+        env.exprs[shfl.getShuffleResult()] = AffineSymbolicExpr::nonAffine();
+        env.uniformity[shfl.getValid()] = SIMTUniformity::SubgroupUniform;
+        env.exprs[shfl.getValid()] = AffineSymbolicExpr::nonAffine();
+        continue;
+      }
+
+      if (auto devInt = dyn_cast<DeviceIntrinsicOp>(op)) {
+        const StringRef kind = devInt.getKind();
+        if (kind == "global_id") {
+          env.exprs[devInt.getResult(0)] =
+              AffineSymbolicExpr::makeGlobalLinearIdX();
+          env.uniformity[devInt.getResult(0)] = SIMTUniformity::LaneDivergent;
+        } else if (kind == "thread_id") {
+          env.exprs[devInt.getResult(0)] =
+              AffineSymbolicExpr::makeVar(SymbolicVarKind::ThreadIdX);
+          env.uniformity[devInt.getResult(0)] = SIMTUniformity::LaneDivergent;
+        } else if (kind == "block_id") {
+          env.exprs[devInt.getResult(0)] =
+              AffineSymbolicExpr::makeVar(SymbolicVarKind::BlockIdX);
+          env.uniformity[devInt.getResult(0)] =
+              SIMTUniformity::WorkgroupUniform;
+        } else if (kind == "block_dim") {
+          env.exprs[devInt.getResult(0)] =
+              AffineSymbolicExpr::makeVar(SymbolicVarKind::BlockDimX);
+          env.uniformity[devInt.getResult(0)] =
+              SIMTUniformity::WorkgroupUniform;
+        } else if (kind == "barrier") {
+          out.push_back(ProtocolStmt::makeWorkgroupBarrier(pcUniformity, loc));
+        } else if (kind == "warp_barrier") {
+          out.push_back(ProtocolStmt::makeSubgroupBarrier(
+              pcUniformity, "gpu::warp_barrier", loc));
+        } else if (kind == "load" && devInt.getNumOperands() >= 2) {
+          if (auto mt = dyn_cast<MemRefType>(devInt.getOperand(0).getType())) {
+            if (auto buf = resolveBuffer(devInt.getOperand(0), mt, env)) {
+              out.push_back(ProtocolStmt::makeAccess(
+                  MemoryAccessMode::Read, buf->name, buf->space,
+                  valExpr(devInt.getOperand(1), env), loc, buf->staticExtent,
+                  buf->dynamicExtentParam));
+            }
+          }
+          if (devInt.getNumResults() > 0) {
+            env.uniformity[devInt.getResult(0)] =
+                valUniformity(devInt.getOperand(1), env);
+            env.exprs[devInt.getResult(0)] = AffineSymbolicExpr::nonAffine();
+          }
+        } else if (kind == "store" && devInt.getNumOperands() >= 3) {
+          if (auto mt = dyn_cast<MemRefType>(devInt.getOperand(0).getType())) {
+            if (auto buf = resolveBuffer(devInt.getOperand(0), mt, env)) {
+              out.push_back(ProtocolStmt::makeAccess(
+                  MemoryAccessMode::Write, buf->name, buf->space,
+                  valExpr(devInt.getOperand(1), env), loc, buf->staticExtent,
+                  buf->dynamicExtentParam));
+            }
+          }
+        }
+        continue;
+      }
+
+      if (isa<arith::IndexCastOp, arith::IndexCastUIOp, arith::ExtSIOp,
+              arith::ExtUIOp, arith::TruncIOp>(op)) {
+        Value src = op->getOperand(0);
+        Value dst = op->getResult(0);
+        env.exprs[dst] = valExpr(src, env);
+        env.uniformity[dst] = valUniformity(src, env);
+        if (env.controlTainted.contains(src)) env.controlTainted.insert(dst);
+        continue;
+      }
+
+      if (auto addOp = dyn_cast<arith::AddIOp>(op)) {
+        Value l = addOp.getLhs(), r = addOp.getRhs(), res = addOp.getResult();
+        env.exprs[res] = addExpr(valExpr(l, env), valExpr(r, env));
+        env.uniformity[res] =
+            joinUniformity(valUniformity(l, env), valUniformity(r, env));
+        if (env.controlTainted.contains(l) || env.controlTainted.contains(r))
+          env.controlTainted.insert(res);
+        continue;
+      }
+
+      if (auto subOp = dyn_cast<arith::SubIOp>(op)) {
+        Value l = subOp.getLhs(), r = subOp.getRhs(), res = subOp.getResult();
+        env.exprs[res] = subExpr(valExpr(l, env), valExpr(r, env));
+        env.uniformity[res] =
+            joinUniformity(valUniformity(l, env), valUniformity(r, env));
+        if (env.controlTainted.contains(l) || env.controlTainted.contains(r))
+          env.controlTainted.insert(res);
+        continue;
+      }
+
+      if (auto mulOp = dyn_cast<arith::MulIOp>(op)) {
+        Value l = mulOp.getLhs(), r = mulOp.getRhs(), res = mulOp.getResult();
+        const auto lE = valExpr(l, env), rE = valExpr(r, env);
+        env.exprs[res] = mulExpr(lE, rE, options_.subgroupSize);
+        env.uniformity[res] =
+            ((lE.isConstant() && lE.constant == 0) ||
+             (rE.isConstant() && rE.constant == 0))
+                ? SIMTUniformity::WorkgroupUniform
+                : joinUniformity(valUniformity(l, env), valUniformity(r, env));
+        if (env.controlTainted.contains(l) || env.controlTainted.contains(r))
+          env.controlTainted.insert(res);
+        continue;
+      }
+
+      if (isa<arith::DivSIOp, arith::DivUIOp>(op)) {
+        Value l = op->getOperand(0), r = op->getOperand(1),
+              res = op->getResult(0);
+        const auto dE =
+            divExpr(valExpr(l, env), valExpr(r, env), options_.subgroupSize);
+        const SIMTUniformity rawU =
+            joinUniformity(valUniformity(l, env), valUniformity(r, env));
+        const bool tainted =
+            env.controlTainted.contains(l) || env.controlTainted.contains(r);
+        env.exprs[res] = dE;
+        env.uniformity[res] =
+            tainted ? rawU : deriveExprUniformity(dE, env, rawU);
+        if (tainted) env.controlTainted.insert(res);
+        continue;
+      }
+
+      if (isa<arith::RemSIOp, arith::RemUIOp>(op)) {
+        Value l = op->getOperand(0), r = op->getOperand(1),
+              res = op->getResult(0);
+        env.exprs[res] =
+            remExpr(valExpr(l, env), valExpr(r, env), options_.subgroupSize);
+        env.uniformity[res] =
+            joinUniformity(valUniformity(l, env), valUniformity(r, env));
+        if (env.controlTainted.contains(l) || env.controlTainted.contains(r))
+          env.controlTainted.insert(res);
+        continue;
+      }
+
+      if (auto shl = dyn_cast<arith::ShLIOp>(op)) {
+        Value l = shl.getLhs(), r = shl.getRhs(), res = shl.getResult();
+        const auto rE = valExpr(r, env);
+        if (rE.isConstant() && rE.constant >= 0 && rE.constant < 62) {
+          env.exprs[res] = mulExpr(
+              valExpr(l, env),
+              AffineSymbolicExpr::makeConstant(std::int64_t{1} << rE.constant),
+              options_.subgroupSize);
+        } else {
+          env.exprs[res] = AffineSymbolicExpr::nonAffine();
+        }
+        env.uniformity[res] =
+            joinUniformity(valUniformity(l, env), valUniformity(r, env));
+        if (env.controlTainted.contains(l) || env.controlTainted.contains(r))
+          env.controlTainted.insert(res);
+        continue;
+      }
+
+      if (isa<arith::ShRSIOp, arith::ShRUIOp>(op)) {
+        Value l = op->getOperand(0), r = op->getOperand(1),
+              res = op->getResult(0);
+        const auto rE = valExpr(r, env);
+        const SIMTUniformity rawU =
+            joinUniformity(valUniformity(l, env), valUniformity(r, env));
+        const bool tainted =
+            env.controlTainted.contains(l) || env.controlTainted.contains(r);
+        if (rE.isConstant() && rE.constant >= 0 && rE.constant < 62) {
+          const auto dE = divExpr(
+              valExpr(l, env),
+              AffineSymbolicExpr::makeConstant(std::int64_t{1} << rE.constant),
+              options_.subgroupSize);
+          env.exprs[res] = dE;
+          env.uniformity[res] =
+              tainted ? rawU : deriveExprUniformity(dE, env, rawU);
+        } else {
+          env.exprs[res] = AffineSymbolicExpr::nonAffine();
+          env.uniformity[res] = rawU;
+        }
+        if (tainted) env.controlTainted.insert(res);
+        continue;
+      }
+
+      if (auto andOp = dyn_cast<arith::AndIOp>(op)) {
+        Value l = andOp.getLhs(), r = andOp.getRhs(), res = andOp.getResult();
+        env.uniformity[res] =
+            joinUniformity(valUniformity(l, env), valUniformity(r, env));
+        if (env.controlTainted.contains(l) || env.controlTainted.contains(r))
+          env.controlTainted.insert(res);
+        if (res.getType().isInteger(1)) {
+          GuardPair gp;
+          const GuardPair gL = valGuard(l, env);
+          const GuardPair gR = valGuard(r, env);
+          gp.whenTrue.contradiction =
+              gL.whenTrue.contradiction || gR.whenTrue.contradiction;
+          gp.whenTrue.constraints = gL.whenTrue.constraints;
+          gp.whenTrue.constraints.insert(gp.whenTrue.constraints.end(),
+                                         gR.whenTrue.constraints.begin(),
+                                         gR.whenTrue.constraints.end());
+          env.guards[res] = std::move(gp);
+          env.exprs[res] = AffineSymbolicExpr::nonAffine();
+        } else {
+          const auto rE = valExpr(r, env);
+          if (rE.isConstant() && rE.constant > 0 &&
+              (rE.constant & (rE.constant + 1)) == 0) {
+            env.exprs[res] =
+                remExpr(valExpr(l, env),
+                        AffineSymbolicExpr::makeConstant(rE.constant + 1),
+                        options_.subgroupSize);
+          } else {
+            env.exprs[res] = AffineSymbolicExpr::nonAffine();
+          }
+        }
+        continue;
+      }
+
+      if (auto xorOp = dyn_cast<arith::XOrIOp>(op)) {
+        Value l = xorOp.getLhs(), r = xorOp.getRhs(), res = xorOp.getResult();
+        env.uniformity[res] =
+            joinUniformity(valUniformity(l, env), valUniformity(r, env));
+        if (env.controlTainted.contains(l) || env.controlTainted.contains(r))
+          env.controlTainted.insert(res);
+        env.exprs[res] = AffineSymbolicExpr::nonAffine();
+        if (res.getType().isInteger(1)) {
+          const auto rE = valExpr(r, env);
+          if (rE.isConstant() && rE.constant == 1) {
+            const GuardPair gL = valGuard(l, env);
+            env.guards[res] = GuardPair{gL.whenFalse, gL.whenTrue};
+          }
+        }
+        continue;
+      }
+
+      if (auto selOp = dyn_cast<arith::SelectOp>(op)) {
+        Value c = selOp.getCondition(), t = selOp.getTrueValue(),
+              f = selOp.getFalseValue(), res = selOp.getResult();
+        const SIMTUniformity cU = valUniformity(c, env);
+        env.uniformity[res] = joinUniformity(
+            cU, joinUniformity(valUniformity(t, env), valUniformity(f, env)));
+        env.exprs[res] = AffineSymbolicExpr::nonAffine();
+        if (cU != SIMTUniformity::WorkgroupUniform ||
+            env.controlTainted.contains(c) || env.controlTainted.contains(t) ||
+            env.controlTainted.contains(f)) {
+          env.controlTainted.insert(res);
+        }
+        continue;
+      }
+
+      if (auto cmpOp = dyn_cast<arith::CmpIOp>(op)) {
+        Value l = cmpOp.getLhs(), r = cmpOp.getRhs(), res = cmpOp.getResult();
+        env.uniformity[res] =
+            joinUniformity(valUniformity(l, env), valUniformity(r, env));
+        if (env.controlTainted.contains(l) || env.controlTainted.contains(r))
+          env.controlTainted.insert(res);
+        env.exprs[res] = AffineSymbolicExpr::nonAffine();
+
+        std::string_view posOp, negOp;
+        switch (cmpOp.getPredicate()) {
+        case arith::CmpIPredicate::eq: posOp = "=="; negOp = "!="; break;
+        case arith::CmpIPredicate::ne: posOp = "!="; negOp = "=="; break;
+        case arith::CmpIPredicate::slt:
+        case arith::CmpIPredicate::ult: posOp = "<"; negOp = ">="; break;
+        case arith::CmpIPredicate::sle:
+        case arith::CmpIPredicate::ule: posOp = "<="; negOp = ">"; break;
+        case arith::CmpIPredicate::sgt:
+        case arith::CmpIPredicate::ugt: posOp = ">"; negOp = "<="; break;
+        case arith::CmpIPredicate::sge:
+        case arith::CmpIPredicate::uge: posOp = ">="; negOp = "<"; break;
+        }
+        GuardPair gp;
+        gp.whenTrue.addComparison(posOp, valExpr(l, env), valExpr(r, env));
+        gp.whenFalse.addComparison(negOp, valExpr(l, env), valExpr(r, env));
+        env.guards[res] = std::move(gp);
+        continue;
+      }
+
+      if (auto affApply = dyn_cast<affine::AffineApplyOp>(op)) {
+        AffineMap map = affApply.getAffineMap();
+        OperandRange ops = affApply.getMapOperands();
+        OperandRange dims = ops.take_front(map.getNumDims());
+        OperandRange syms = ops.drop_front(map.getNumDims());
+        if (map.getNumResults() == 1) {
+          auto [e, u] = evalAffineExpr(map.getResult(0), dims, syms, env);
+          env.exprs[affApply.getResult()] = std::move(e);
+          env.uniformity[affApply.getResult()] = u;
+        } else {
+          env.exprs[affApply.getResult()] = AffineSymbolicExpr::nonAffine();
+          env.uniformity[affApply.getResult()] = SIMTUniformity::LaneDivergent;
+        }
+        continue;
+      }
+
+      if (auto allocaOp = dyn_cast<memref::AllocaOp>(op)) {
+        if (allocaOp.getType().getRank() == 0) {
+          env.slotUniformity[allocaOp.getResult()] = pcUniformity;
+          env.slotExprs[allocaOp.getResult()] = AffineSymbolicExpr::nonAffine();
+        } else {
+          (void)resolveBuffer(allocaOp.getResult(), allocaOp.getType(), env);
+        }
+        continue;
+      }
+
+      if (auto allocOp = dyn_cast<memref::AllocOp>(op)) {
+        (void)resolveBuffer(allocOp.getResult(), allocOp.getType(), env);
+        continue;
+      }
+
+      if (auto getGlob = dyn_cast<memref::GetGlobalOp>(op)) {
+        (void)resolveBuffer(getGlob.getResult(), getGlob.getType(), env);
+        continue;
+      }
+
+      if (auto loadOp = dyn_cast<memref::LoadOp>(op)) {
+        Value base = unwrapMemRefBase(loadOp.getMemref());
+        if (loadOp.getMemRefType().getRank() == 0 &&
+            isa_and_nonnull<memref::AllocaOp>(base.getDefiningOp())) {
+          Value res = loadOp.getResult();
+          const SIMTUniformity sU = env.slotUniformity.lookup(base);
+          env.uniformity[res] = sU;
+          env.exprs[res] = env.slotExprs.contains(base)
+                               ? env.slotExprs[base]
+                               : AffineSymbolicExpr::nonAffine();
+          if (env.slotGuards.contains(base)) env.guards[res] = env.slotGuards[base];
+          if (sU != SIMTUniformity::WorkgroupUniform)
+            env.controlTainted.insert(res);
+          continue;
+        }
+        SIMTUniformity idxU = SIMTUniformity::WorkgroupUniform;
+        SmallVector<AffineSymbolicExpr, 4> idxExprs;
+        for (Value idx : loadOp.getIndices()) {
+          idxExprs.push_back(valExpr(idx, env));
+          idxU = joinUniformity(idxU, valUniformity(idx, env));
+        }
+        if (auto buf = resolveBuffer(loadOp.getMemref(), loadOp.getMemRefType(),
+                                     env)) {
+          out.push_back(ProtocolStmt::makeAccess(
+              MemoryAccessMode::Read, buf->name, buf->space,
+              linearizeIndices(idxExprs, *buf), loc, buf->staticExtent,
+              buf->dynamicExtentParam));
+        }
+        env.uniformity[loadOp.getResult()] = idxU;
+        env.exprs[loadOp.getResult()] = AffineSymbolicExpr::nonAffine();
+        continue;
+      }
+
+      if (auto storeOp = dyn_cast<memref::StoreOp>(op)) {
+        Value base = unwrapMemRefBase(storeOp.getMemref());
+        if (storeOp.getMemRefType().getRank() == 0 &&
+            isa_and_nonnull<memref::AllocaOp>(base.getDefiningOp())) {
+          Value val = storeOp.getValueToStore();
+          const SIMTUniformity newU = joinUniformity(
+              env.slotUniformity.lookup(base),
+              joinUniformity(pcUniformity, valUniformity(val, env)));
+          env.slotUniformity[base] = newU;
+          env.slotExprs[base] = (pcUniformity == SIMTUniformity::WorkgroupUniform)
+                                    ? valExpr(val, env)
+                                    : AffineSymbolicExpr::nonAffine();
+          if (pcUniformity == SIMTUniformity::WorkgroupUniform &&
+              env.guards.contains(val)) {
+            env.slotGuards[base] = env.guards[val];
+          } else {
+            env.slotGuards.erase(base);
+          }
+          continue;
+        }
+        SmallVector<AffineSymbolicExpr, 4> idxExprs;
+        for (Value idx : storeOp.getIndices()) {
+          idxExprs.push_back(valExpr(idx, env));
+        }
+        if (auto buf = resolveBuffer(storeOp.getMemref(),
+                                     storeOp.getMemRefType(), env)) {
+          out.push_back(ProtocolStmt::makeAccess(
+              MemoryAccessMode::Write, buf->name, buf->space,
+              linearizeIndices(idxExprs, *buf), loc, buf->staticExtent,
+              buf->dynamicExtentParam));
+        }
+        continue;
+      }
+
+      if (auto affLoad = dyn_cast<affine::AffineLoadOp>(op)) {
+        AffineMap map = affLoad.getAffineMap();
+        OperandRange ops = affLoad.getMapOperands();
+        OperandRange dims = ops.take_front(map.getNumDims());
+        OperandRange syms = ops.drop_front(map.getNumDims());
+        SmallVector<AffineSymbolicExpr, 4> idxExprs;
+        SIMTUniformity idxU = SIMTUniformity::WorkgroupUniform;
+        for (AffineExpr r : map.getResults()) {
+          auto [e, u] = evalAffineExpr(r, dims, syms, env);
+          idxExprs.push_back(std::move(e));
+          idxU = joinUniformity(idxU, u);
+        }
+        if (auto buf = resolveBuffer(affLoad.getMemRef(),
+                                     affLoad.getMemRefType(), env)) {
+          out.push_back(ProtocolStmt::makeAccess(
+              MemoryAccessMode::Read, buf->name, buf->space,
+              linearizeIndices(idxExprs, *buf), loc, buf->staticExtent,
+              buf->dynamicExtentParam));
+        }
+        env.uniformity[affLoad.getResult()] = idxU;
+        env.exprs[affLoad.getResult()] = AffineSymbolicExpr::nonAffine();
+        continue;
+      }
+
+      if (auto affStore = dyn_cast<affine::AffineStoreOp>(op)) {
+        AffineMap map = affStore.getAffineMap();
+        OperandRange ops = affStore.getMapOperands();
+        OperandRange dims = ops.take_front(map.getNumDims());
+        OperandRange syms = ops.drop_front(map.getNumDims());
+        SmallVector<AffineSymbolicExpr, 4> idxExprs;
+        for (AffineExpr r : map.getResults()) {
+          auto [e, _] = evalAffineExpr(r, dims, syms, env);
+          idxExprs.push_back(std::move(e));
+        }
+        if (auto buf = resolveBuffer(affStore.getMemRef(),
+                                     affStore.getMemRefType(), env)) {
+          out.push_back(ProtocolStmt::makeAccess(
+              MemoryAccessMode::Write, buf->name, buf->space,
+              linearizeIndices(idxExprs, *buf), loc, buf->staticExtent,
+              buf->dynamicExtentParam));
+        }
+        continue;
+      }
+
+      if (auto scfIf = dyn_cast<scf::IfOp>(op)) {
+        const SIMTUniformity condU = valUniformity(scfIf.getCondition(), env);
+        const SIMTUniformity branchPC = joinUniformity(pcUniformity, condU);
+        const GuardPair gp = valGuard(scfIf.getCondition(), env);
+        const Env preEnv = env;
+        Env thenEnv = preEnv;
+        Env elseEnv = preEnv;
+        std::vector<ProtocolStmt> thenStmts;
+        std::vector<ProtocolStmt> elseStmts;
+
+        if (!scfIf.getThenRegion().empty()) {
+          extractBlock(scfIf.getThenRegion().front(), branchPC, thenEnv,
+                       thenStmts, retSummary);
+        }
+        if (!scfIf.getElseRegion().empty()) {
+          extractBlock(scfIf.getElseRegion().front(), branchPC, elseEnv,
+                       elseStmts, retSummary);
+        }
+        mergeBranchSlots(branchPC, preEnv, thenEnv, elseEnv, env);
+
+        Operation *thenTerm = scfIf.getThenRegion().empty()
+                                  ? nullptr
+                                  : scfIf.getThenRegion().front().getTerminator();
+        Operation *elseTerm = scfIf.getElseRegion().empty()
+                                  ? nullptr
+                                  : scfIf.getElseRegion().front().getTerminator();
+        for (auto [idx, res] : llvm::enumerate(scfIf.getResults())) {
+          SIMTUniformity rU = condU;
+          if (thenTerm && idx < thenTerm->getNumOperands())
+            rU = joinUniformity(rU,
+                                valUniformity(thenTerm->getOperand(idx), thenEnv));
+          if (elseTerm && idx < elseTerm->getNumOperands())
+            rU = joinUniformity(rU,
+                                valUniformity(elseTerm->getOperand(idx), elseEnv));
+          env.uniformity[res] = rU;
+          env.exprs[res] = AffineSymbolicExpr::nonAffine();
+          if (condU != SIMTUniformity::WorkgroupUniform)
+            env.controlTainted.insert(res);
+        }
+
+        out.push_back(ProtocolStmt::makeConditional(
+            condU, gp.whenTrue, gp.whenFalse, std::move(thenStmts),
+            std::move(elseStmts), loc));
+        continue;
+      }
+
+      if (auto affIf = dyn_cast<affine::AffineIfOp>(op)) {
+        IntegerSet set = affIf.getIntegerSet();
+        OperandRange ops = affIf.getOperands();
+        OperandRange dims = ops.take_front(set.getNumDims());
+        OperandRange syms = ops.drop_front(set.getNumDims());
+
+        SIMTUniformity condU = SIMTUniformity::WorkgroupUniform;
+        SymbolicGuard thenG, elseG;
+        for (unsigned c = 0; c < set.getNumConstraints(); ++c) {
+          auto [cE, cU] = evalAffineExpr(set.getConstraint(c), dims, syms, env);
+          condU = joinUniformity(condU, cU);
+          if (set.isEq(c)) {
+            thenG.addComparison("==", cE, AffineSymbolicExpr::makeConstant(0));
+            if (set.getNumConstraints() == 1)
+              elseG.addComparison("!=", cE, AffineSymbolicExpr::makeConstant(0));
+          } else {
+            thenG.addComparison(">=", cE, AffineSymbolicExpr::makeConstant(0));
+            if (set.getNumConstraints() == 1)
+              elseG.addComparison("<", cE, AffineSymbolicExpr::makeConstant(0));
+          }
+        }
+
+        const SIMTUniformity branchPC = joinUniformity(pcUniformity, condU);
+        const Env preEnv = env;
+        Env thenEnv = preEnv;
+        Env elseEnv = preEnv;
+        std::vector<ProtocolStmt> thenStmts;
+        std::vector<ProtocolStmt> elseStmts;
+
+        if (!affIf.getThenRegion().empty()) {
+          extractBlock(affIf.getThenRegion().front(), branchPC, thenEnv,
+                       thenStmts, retSummary);
+        }
+        if (!affIf.getElseRegion().empty()) {
+          extractBlock(affIf.getElseRegion().front(), branchPC, elseEnv,
+                       elseStmts, retSummary);
+        }
+        mergeBranchSlots(branchPC, preEnv, thenEnv, elseEnv, env);
+
+        Operation *thenTerm = affIf.getThenRegion().empty()
+                                  ? nullptr
+                                  : affIf.getThenRegion().front().getTerminator();
+        Operation *elseTerm = affIf.getElseRegion().empty()
+                                  ? nullptr
+                                  : affIf.getElseRegion().front().getTerminator();
+        for (auto [idx, res] : llvm::enumerate(affIf.getResults())) {
+          SIMTUniformity rU = condU;
+          if (thenTerm && idx < thenTerm->getNumOperands())
+            rU = joinUniformity(rU,
+                                valUniformity(thenTerm->getOperand(idx), thenEnv));
+          if (elseTerm && idx < elseTerm->getNumOperands())
+            rU = joinUniformity(rU,
+                                valUniformity(elseTerm->getOperand(idx), elseEnv));
+          env.uniformity[res] = rU;
+          env.exprs[res] = AffineSymbolicExpr::nonAffine();
+          if (condU != SIMTUniformity::WorkgroupUniform)
+            env.controlTainted.insert(res);
+        }
+
+        out.push_back(ProtocolStmt::makeConditional(
+            condU, std::move(thenG), std::move(elseG), std::move(thenStmts),
+            std::move(elseStmts), loc));
+        continue;
+      }
+
+      if (auto scfFor = dyn_cast<scf::ForOp>(op)) {
+        const auto lbE = valExpr(scfFor.getLowerBound(), env);
+        const auto ubE = valExpr(scfFor.getUpperBound(), env);
+        const auto stE = valExpr(scfFor.getStep(), env);
+        const SIMTUniformity headerU = joinUniformity(
+            valUniformity(scfFor.getLowerBound(), env),
+            joinUniformity(valUniformity(scfFor.getUpperBound(), env),
+                           valUniformity(scfFor.getStep(), env)));
+        const SIMTUniformity bodyPC = joinUniformity(pcUniformity, headerU);
+        const std::string ivName = "iv_" + std::to_string(nextLoopId_++);
+        const std::int64_t stepVal =
+            (stE.isConstant() && stE.constant > 0) ? stE.constant : 1;
+        const bool bounded = stE.isConstant() && stE.constant > 0;
+
+        Env loopEnv = env;
+        loopEnv.exprs[scfFor.getInductionVar()] =
+            AffineSymbolicExpr::makeVar(SymbolicVarKind::LoopVar, ivName);
+        loopEnv.uniformity[scfFor.getInductionVar()] = headerU;
+        loopEnv.loopVarUniformity[ivName] = headerU;
+        for (auto [initV, iterArg] :
+             llvm::zip(scfFor.getInitArgs(), scfFor.getRegionIterArgs())) {
+          loopEnv.uniformity[iterArg] =
+              joinUniformity(headerU, valUniformity(initV, env));
+          loopEnv.exprs[iterArg] = AffineSymbolicExpr::nonAffine();
+        }
+
+        std::vector<ProtocolStmt> bodyStmts;
+        extractBlock(*scfFor.getBody(), bodyPC, loopEnv, bodyStmts, retSummary);
+
+        Operation *yieldOp = scfFor.getBody()->getTerminator();
+        for (auto [idx, res] : llvm::enumerate(scfFor.getResults())) {
+          SIMTUniformity yU = headerU;
+          if (idx < scfFor.getInitArgs().size())
+            yU = joinUniformity(yU, valUniformity(scfFor.getInitArgs()[idx], env));
+          if (yieldOp && idx < yieldOp->getNumOperands())
+            yU = joinUniformity(yU,
+                                valUniformity(yieldOp->getOperand(idx), loopEnv));
+          env.uniformity[res] = yU;
+          env.exprs[res] = AffineSymbolicExpr::nonAffine();
+        }
+        mergeBranchSlots(bodyPC, env, loopEnv, env, env);
+
+        out.push_back(ProtocolStmt::makeLoop(ivName, lbE, ubE, stepVal, headerU,
+                                             bounded, std::move(bodyStmts), loc));
+        continue;
+      }
+
+      if (auto affFor = dyn_cast<affine::AffineForOp>(op)) {
+        AffineMap lbMap = affFor.getLowerBoundMap();
+        OperandRange lbOps = affFor.getLowerBoundOperands();
+        AffineMap ubMap = affFor.getUpperBoundMap();
+        OperandRange ubOps = affFor.getUpperBoundOperands();
+
+        AffineSymbolicExpr lbE = AffineSymbolicExpr::nonAffine();
+        SIMTUniformity lbU = SIMTUniformity::WorkgroupUniform;
+        if (lbMap.getNumResults() == 1) {
+          std::tie(lbE, lbU) = evalAffineExpr(
+              lbMap.getResult(0), lbOps.take_front(lbMap.getNumDims()),
+              lbOps.drop_front(lbMap.getNumDims()), env);
+        } else {
+          for (Value v : lbOps) lbU = joinUniformity(lbU, valUniformity(v, env));
+        }
+
+        AffineSymbolicExpr ubE = AffineSymbolicExpr::nonAffine();
+        SIMTUniformity ubU = SIMTUniformity::WorkgroupUniform;
+        if (ubMap.getNumResults() == 1) {
+          std::tie(ubE, ubU) = evalAffineExpr(
+              ubMap.getResult(0), ubOps.take_front(ubMap.getNumDims()),
+              ubOps.drop_front(ubMap.getNumDims()), env);
+        } else {
+          for (Value v : ubOps) ubU = joinUniformity(ubU, valUniformity(v, env));
+        }
+
+        const SIMTUniformity headerU = joinUniformity(lbU, ubU);
+        const SIMTUniformity bodyPC = joinUniformity(pcUniformity, headerU);
+        const std::string ivName = "iv_" + std::to_string(nextLoopId_++);
+        const std::int64_t stepVal = affFor.getStepAsInt();
+
+        Env loopEnv = env;
+        loopEnv.exprs[affFor.getInductionVar()] =
+            AffineSymbolicExpr::makeVar(SymbolicVarKind::LoopVar, ivName);
+        loopEnv.uniformity[affFor.getInductionVar()] = headerU;
+        loopEnv.loopVarUniformity[ivName] = headerU;
+        for (auto [initV, iterArg] :
+             llvm::zip(affFor.getInits(), affFor.getRegionIterArgs())) {
+          loopEnv.uniformity[iterArg] =
+              joinUniformity(headerU, valUniformity(initV, env));
+          loopEnv.exprs[iterArg] = AffineSymbolicExpr::nonAffine();
+        }
+
+        std::vector<ProtocolStmt> bodyStmts;
+        extractBlock(*affFor.getBody(), bodyPC, loopEnv, bodyStmts, retSummary);
+
+        Operation *yieldOp = affFor.getBody()->getTerminator();
+        for (auto [idx, res] : llvm::enumerate(affFor.getResults())) {
+          SIMTUniformity yU = headerU;
+          if (idx < affFor.getInits().size())
+            yU = joinUniformity(yU, valUniformity(affFor.getInits()[idx], env));
+          if (yieldOp && idx < yieldOp->getNumOperands())
+            yU = joinUniformity(yU,
+                                valUniformity(yieldOp->getOperand(idx), loopEnv));
+          env.uniformity[res] = yU;
+          env.exprs[res] = AffineSymbolicExpr::nonAffine();
+        }
+        mergeBranchSlots(bodyPC, env, loopEnv, env, env);
+
+        out.push_back(ProtocolStmt::makeLoop(ivName, lbE, ubE, stepVal, headerU,
+                                             /*boundedFor=*/true,
+                                             std::move(bodyStmts), loc));
+        continue;
+      }
+
+      if (auto whileOp = dyn_cast<scf::WhileOp>(op)) {
+        SmallVector<SIMTUniformity> argU;
+        for (Value initV : whileOp.getInits())
+          argU.push_back(valUniformity(initV, env));
+
+        SIMTUniformity headerU = SIMTUniformity::WorkgroupUniform;
+        for (SIMTUniformity u : argU) headerU = joinUniformity(headerU, u);
+
+        // Two-pass fixed-point so loop-carried or exit-condition divergence
+        // taints barriers anywhere inside `before` or `after`.
+        std::vector<ProtocolStmt> bodyStmts;
+        Env finalLoopEnv = env;
+        for (int pass = 0; pass < 2; ++pass) {
+          bodyStmts.clear();
+          Env loopEnv = env;
+          for (auto [idx, bArg] : llvm::enumerate(whileOp.getBeforeArguments())) {
+            loopEnv.uniformity[bArg] = joinUniformity(headerU, argU[idx]);
+            loopEnv.exprs[bArg] = AffineSymbolicExpr::nonAffine();
+          }
+          const SIMTUniformity curPC = joinUniformity(pcUniformity, headerU);
+          extractBlock(whileOp.getBefore().front(), curPC, loopEnv, bodyStmts,
+                       retSummary);
+          auto condOp =
+              cast<scf::ConditionOp>(whileOp.getBefore().front().getTerminator());
+          headerU =
+              joinUniformity(headerU, valUniformity(condOp.getCondition(), loopEnv));
+
+          const SIMTUniformity afterPC = joinUniformity(pcUniformity, headerU);
+          for (auto [cVal, aArg] :
+               llvm::zip(condOp.getArgs(), whileOp.getAfterArguments())) {
+            loopEnv.uniformity[aArg] =
+                joinUniformity(headerU, valUniformity(cVal, loopEnv));
+            loopEnv.exprs[aArg] = AffineSymbolicExpr::nonAffine();
+          }
+          extractBlock(whileOp.getAfter().front(), afterPC, loopEnv, bodyStmts,
+                       retSummary);
+          auto yieldOp =
+              cast<scf::YieldOp>(whileOp.getAfter().front().getTerminator());
+          for (auto [idx, yVal] : llvm::enumerate(yieldOp.getOperands())) {
+            if (idx < argU.size()) {
+              argU[idx] = joinUniformity(argU[idx], valUniformity(yVal, loopEnv));
+              headerU = joinUniformity(headerU, argU[idx]);
+            }
+          }
+          finalLoopEnv = std::move(loopEnv);
+        }
+
+        auto condOp =
+            cast<scf::ConditionOp>(whileOp.getBefore().front().getTerminator());
+        for (auto [cVal, res] :
+             llvm::zip(condOp.getArgs(), whileOp.getResults())) {
+          env.uniformity[res] =
+              joinUniformity(headerU, valUniformity(cVal, finalLoopEnv));
+          env.exprs[res] = AffineSymbolicExpr::nonAffine();
+        }
+        mergeBranchSlots(joinUniformity(pcUniformity, headerU), env,
+                         finalLoopEnv, env, env);
+
+        const std::string ivName = "while_" + std::to_string(nextLoopId_++);
+        out.push_back(ProtocolStmt::makeLoop(
+            ivName, AffineSymbolicExpr::nonAffine(),
+            AffineSymbolicExpr::nonAffine(), 1, headerU, /*boundedFor=*/false,
+            std::move(bodyStmts), loc));
+        continue;
+      }
+
+      if (auto callOp = dyn_cast<func::CallOp>(op)) {
+        const std::string calleeName = callOp.getCallee().str();
+        auto calleeIt = helperFuncs_.find(calleeName);
+        if (calleeIt != helperFuncs_.end() &&
+            !calleeIt->second.getBody().empty() &&
+            calleeIt->second.getBody().hasOneBlock() &&
+            !activeCallStack_.contains(calleeName)) {
+          activeCallStack_.insert(calleeName);
+          func::FuncOp callee = calleeIt->second;
+          Block &calleeEntry = callee.getBody().front();
+          Env calleeEnv;
+          calleeEnv.loopVarUniformity = env.loopVarUniformity;
+          for (auto [operand, param] :
+               llvm::zip(callOp.getOperands(), calleeEntry.getArguments())) {
+            if (auto mt = dyn_cast<MemRefType>(operand.getType())) {
+              if (auto buf = resolveBuffer(operand, mt, env))
+                calleeEnv.buffers[param] = *buf;
+            } else {
+              calleeEnv.exprs[param] = valExpr(operand, env);
+              calleeEnv.uniformity[param] = valUniformity(operand, env);
+              if (env.guards.contains(operand))
+                calleeEnv.guards[param] = env.guards[operand];
+              if (env.controlTainted.contains(operand))
+                calleeEnv.controlTainted.insert(param);
+            }
+          }
+          CallReturnSummary subRet;
+          extractBlock(calleeEntry, pcUniformity, calleeEnv, out, &subRet);
+          activeCallStack_.erase(calleeName);
+          if (callOp.getNumResults() == 1 && subRet.seen) {
+            env.exprs[callOp.getResult(0)] = subRet.expr;
+            env.uniformity[callOp.getResult(0)] = subRet.uniformity;
+          } else {
+            for (Value r : callOp.getResults()) {
+              env.exprs[r] = AffineSymbolicExpr::nonAffine();
+              env.uniformity[r] = pcUniformity;
+            }
+          }
+          continue;
+        }
+      }
+
+      if (auto retOp = dyn_cast<func::ReturnOp>(op)) {
+        if (retSummary && retOp.getNumOperands() == 1) {
+          Value rv = retOp.getOperand(0);
+          const auto rE = valExpr(rv, env);
+          const SIMTUniformity rU =
+              joinUniformity(pcUniformity, valUniformity(rv, env));
+          if (!retSummary->seen) {
+            retSummary->expr = rE;
+            retSummary->uniformity = rU;
+            retSummary->seen = true;
+          } else {
+            retSummary->expr = AffineSymbolicExpr::nonAffine();
+            retSummary->uniformity = joinUniformity(retSummary->uniformity, rU);
+          }
+        }
+        continue;
+      }
+
+      // Default propagation for floating-point / miscellaneous pure ops.
+      if (op->getNumResults() > 0 && op->getNumRegions() == 0) {
+        SIMTUniformity u = SIMTUniformity::WorkgroupUniform;
+        bool tainted = false;
+        for (Value operand : op->getOperands()) {
+          u = joinUniformity(u, valUniformity(operand, env));
+          if (env.controlTainted.contains(operand)) tainted = true;
+        }
+        for (Value res : op->getResults()) {
+          env.uniformity[res] = u;
+          env.exprs[res] = AffineSymbolicExpr::nonAffine();
+          if (tainted) env.controlTainted.insert(res);
+        }
+      }
+    }
+  }
+};
+
+} // namespace
+
+LogicalResult verifyGPUBarrierUniformityAndAccessProtocols(
+    ModuleOp module, const verification::GPUMemoryAccessProtocolOptions &options) {
+  return MLIRAccessProtocolVerifier(module, options).run();
+}
+
+namespace {
+
+std::optional<std::size_t> parseAttrUnsigned(StringRef text) {
+  if (text.empty()) return std::nullopt;
+  unsigned long long v = 0;
+  if (text.getAsInteger(10, v)) return std::nullopt;
+  return static_cast<std::size_t>(v);
+}
+
+std::optional<verification::GPUPublicationOrder>
+parseMLIRPublication(StringRef text) {
+  if (text == "relaxed") return verification::GPUPublicationOrder::Relaxed;
+  if (text == "acquire_workgroup")
+    return verification::GPUPublicationOrder::AcquireWorkgroup;
+  if (text == "release_workgroup")
+    return verification::GPUPublicationOrder::ReleaseWorkgroup;
+  if (text == "acq_rel_workgroup")
+    return verification::GPUPublicationOrder::AcqRelWorkgroup;
+  if (text == "acquire_device")
+    return verification::GPUPublicationOrder::AcquireDevice;
+  if (text == "release_device")
+    return verification::GPUPublicationOrder::ReleaseDevice;
+  if (text == "acq_rel_device")
+    return verification::GPUPublicationOrder::AcqRelDevice;
+  return std::nullopt;
+}
+
+std::string getDictStr(DictionaryAttr dict, StringRef key) {
+  if (!dict) return {};
+  if (auto s = dict.getAs<StringAttr>(key)) return s.getValue().str();
+  return {};
+}
+
+// Reconstructs a `BehavioralAutomaton` from a `StageOp`'s `deferred_body` +
+// `deferred_cfg` attributes so parsed or in-memory MLIR modules are verified
+// directly without relying on an external GraphIR object.
+verification::BehavioralAutomaton
+extractMLIRStageAutomaton(StageOp stageOp, const std::string &qualifiedName,
+                          const std::map<std::string, std::string> &portMap) {
+  verification::BehavioralAutomaton aut;
+  aut.name = qualifiedName;
+  aut.location = mlirLocToSourceLoc(stageOp.getLoc());
+
+  // Index deferred_body operations by integer `id`!
+  std::map<std::int64_t, DictionaryAttr> opById;
+  std::function<void(ArrayAttr)> indexDeferredOps = [&](ArrayAttr arr) {
+    if (!arr) return;
+    for (Attribute elem : arr) {
+      auto d = dyn_cast<DictionaryAttr>(elem);
+      if (!d) continue;
+      if (auto idAttr = d.getAs<IntegerAttr>("id")) {
+        opById[idAttr.getInt()] = d;
+      }
+      for (StringRef subKey : {"initialization", "condition", "body",
+                               "alternative", "step", "offer_branches"}) {
+        if (auto subArr = d.getAs<ArrayAttr>(subKey)) indexDeferredOps(subArr);
+      }
+    }
+  };
+  indexDeferredOps(stageOp.getDeferredBody());
+
+  auto resolveEp = [&](const std::string &ep) -> std::string {
+    auto it = portMap.find(ep);
+    return it != portMap.end() ? it->second : ep;
+  };
+
+  ArrayAttr cfgBlocks = stageOp.getDeferredCfg();
+  if (!cfgBlocks || cfgBlocks.empty()) {
+    aut.states.push_back({0, "terminal", true, std::nullopt, aut.location});
+    aut.initialState = 0;
+    return aut;
+  }
+
+  std::map<std::int64_t, verification::AutomatonStateId> blockEntry;
+  std::map<std::int64_t, DictionaryAttr> cfgBlockById;
+
+  auto addState = [&](std::string lbl, bool term = false) {
+    const verification::AutomatonStateId id = aut.states.size();
+    aut.states.push_back(
+        {id, std::move(lbl), term, std::nullopt, aut.location});
+    return id;
+  };
+
+  std::optional<std::int64_t> firstBlockId;
+  for (Attribute bAttr : cfgBlocks) {
+    auto bDict = dyn_cast<DictionaryAttr>(bAttr);
+    if (!bDict) continue;
+    auto idAttr = bDict.getAs<IntegerAttr>("id");
+    if (!idAttr) continue;
+    const std::int64_t bid = idAttr.getInt();
+    if (!firstBlockId) firstBlockId = bid;
+    cfgBlockById[bid] = bDict;
+    std::string lbl = "bb" + std::to_string(bid);
+    if (auto props = bDict.getAs<DictionaryAttr>("properties")) {
+      const std::string role = getDictStr(props, "role");
+      if (!role.empty()) lbl += ":" + role;
+    }
+    blockEntry[bid] = addState(std::move(lbl), false);
+  }
+
+  const auto terminalId = addState("terminal", true);
+  aut.initialState =
+      (firstBlockId && blockEntry.contains(*firstBlockId))
+          ? blockEntry[*firstBlockId]
+          : terminalId;
+
+  for (Attribute bAttr : cfgBlocks) {
+    auto bDict = dyn_cast<DictionaryAttr>(bAttr);
+    if (!bDict) continue;
+    auto idAttr = bDict.getAs<IntegerAttr>("id");
+    if (!idAttr) continue;
+    verification::AutomatonStateId cursor = blockEntry[idAttr.getInt()];
+    std::vector<std::string> pendingMarkers;
+
+    if (auto opsArr = bDict.getAs<ArrayAttr>("operations")) {
+      for (Attribute opIdAttr : opsArr) {
+        auto intId = dyn_cast<IntegerAttr>(opIdAttr);
+        if (!intId || !opById.contains(intId.getInt())) continue;
+        DictionaryAttr opDict = opById[intId.getInt()];
+        const std::string kind = getDictStr(opDict, "kind");
+        DictionaryAttr props = opDict.getAs<DictionaryAttr>("properties");
+
+        if (kind == "progress_marker") {
+          const std::string mName = getDictStr(opDict, "name");
+          if (!mName.empty()) {
+            pendingMarkers.push_back(mName);
+            aut.requiredProgressMarkers.insert(mName);
+          }
+          continue;
+        }
+        if (kind == "channel_send" || kind == "channel_recv" ||
+            kind == "channel_receive") {
+          const auto afterState =
+              addState("post_" + std::to_string(intId.getInt()), false);
+          verification::ProcessTransition tr;
+          tr.source = cursor;
+          tr.target = afterState;
+          tr.kind = kind == "channel_send"
+                        ? verification::BehavioralActionKind::Send
+                        : verification::BehavioralActionKind::Receive;
+          tr.endpoint = resolveEp(getDictStr(props, "endpoint"));
+          tr.message = getDictStr(props, "message");
+          tr.delivery = getDictStr(props, "delivery") == "same_step"
+                            ? graphir::ChannelDeliveryMode::SameStep
+                            : graphir::ChannelDeliveryMode::BlockingQueue;
+          tr.transfersOwnership =
+              getDictStr(props, "ownership_transfer") == "move";
+          tr.progressMarkers = std::move(pendingMarkers);
+          pendingMarkers.clear();
+          aut.transitions.push_back(std::move(tr));
+          cursor = afterState;
+        }
+      }
+    }
+
+    const std::string termKind = getDictStr(bDict, "terminator");
+    if (termKind == "return") {
+      verification::ProcessTransition tr;
+      tr.source = cursor;
+      tr.target = terminalId;
+      tr.kind = verification::BehavioralActionKind::Internal;
+      tr.progressMarkers = std::move(pendingMarkers);
+      aut.transitions.push_back(std::move(tr));
+    } else if (termKind == "branch") {
+      auto succ = bDict.getAs<IntegerAttr>("successor");
+      if (succ && blockEntry.contains(succ.getInt())) {
+        verification::ProcessTransition tr;
+        tr.source = cursor;
+        tr.target = blockEntry[succ.getInt()];
+        tr.kind = verification::BehavioralActionKind::Internal;
+        tr.progressMarkers = std::move(pendingMarkers);
+        aut.transitions.push_back(std::move(tr));
+      }
+    } else if (termKind == "conditional_branch") {
+      auto tSucc = bDict.getAs<IntegerAttr>("successor");
+      auto fSucc = bDict.getAs<IntegerAttr>("false_successor");
+      if (tSucc && fSucc && blockEntry.contains(tSucc.getInt()) &&
+          blockEntry.contains(fSucc.getInt())) {
+        const std::string ctrl = getDictStr(bDict, "control");
+        auto bProps = bDict.getAs<DictionaryAttr>("properties");
+        const bool isOfferDispatch = StringRef(ctrl).starts_with("offer:");
+        const bool isOfferCont = getDictStr(bProps, "role") == "offer.next";
+
+        if (isOfferDispatch && !isOfferCont) {
+          // Reconstruct non-blocking `AutomatonOfferGroup` across `offer.next`
+          // chain and mark `offer.default` fallback edge.
+          DictionaryAttr offerOpDict;
+          for (const auto &[oid, od] : opById) {
+            (void)oid;
+            if (getDictStr(od, "kind") == "offer") {
+              offerOpDict = od;
+              break;
+            }
+          }
+          verification::AutomatonOfferGroup group;
+          if (offerOpDict) {
+            auto oProps = offerOpDict.getAs<DictionaryAttr>("properties");
+            group.mode = getDictStr(oProps, "offer_mode") == "conjunctive"
+                             ? graphir::OfferMode::Conjunctive
+                             : graphir::OfferMode::Exclusive;
+          }
+          ArrayAttr armArray =
+              offerOpDict ? offerOpDict.getAs<ArrayAttr>("offer_branches")
+                          : ArrayAttr{};
+          std::int64_t curDisp = idAttr.getInt();
+          std::size_t armIdx = 0;
+          while (cfgBlockById.contains(curDisp)) {
+            DictionaryAttr dBlk = cfgBlockById[curDisp];
+            auto dTSucc = dBlk.getAs<IntegerAttr>("successor");
+            auto dFSucc = dBlk.getAs<IntegerAttr>("false_successor");
+            if (!dTSucc || !dFSucc || !blockEntry.contains(dTSucc.getInt()) ||
+                !blockEntry.contains(dFSucc.getInt())) {
+              break;
+            }
+            const auto armTarget = blockEntry[dTSucc.getInt()];
+            if (armArray && armIdx < armArray.size()) {
+              if (auto armDict = dyn_cast<DictionaryAttr>(armArray[armIdx])) {
+                auto aProps = armDict.getAs<DictionaryAttr>("properties");
+                const auto armKind =
+                    getDictStr(aProps, "direction") == "send"
+                        ? verification::BehavioralActionKind::Send
+                        : verification::BehavioralActionKind::Receive;
+                const std::string armEp =
+                    resolveEp(getDictStr(aProps, "endpoint"));
+                const std::string armMsg = getDictStr(aProps, "message");
+                group.arms.push_back(
+                    {armKind, armEp, armMsg, armTarget, aut.location});
+
+                bool armHasExplicitChOp = false;
+                if (cfgBlockById.contains(dTSucc.getInt())) {
+                  if (auto armOps = cfgBlockById[dTSucc.getInt()]
+                                        .getAs<ArrayAttr>("operations")) {
+                    for (Attribute aOpAttr : armOps) {
+                      auto aInt = dyn_cast<IntegerAttr>(aOpAttr);
+                      if (aInt && opById.contains(aInt.getInt())) {
+                        const std::string ak =
+                            getDictStr(opById[aInt.getInt()], "kind");
+                        if (ak == "channel_send" || ak == "channel_recv" ||
+                            ak == "channel_receive") {
+                          armHasExplicitChOp = true;
+                          break;
+                        }
+                      }
+                    }
+                  }
+                }
+                verification::ProcessTransition armTr;
+                armTr.source = cursor;
+                armTr.target = armTarget;
+                armTr.kind = armHasExplicitChOp
+                                 ? verification::BehavioralActionKind::Internal
+                                 : armKind;
+                armTr.endpoint = armEp;
+                armTr.message = armMsg;
+                armTr.progressMarkers = pendingMarkers;
+                aut.transitions.push_back(std::move(armTr));
+              }
+            }
+            const std::int64_t fbId = dFSucc.getInt();
+            if (!cfgBlockById.contains(fbId)) break;
+            auto fbProps =
+                cfgBlockById[fbId].getAs<DictionaryAttr>("properties");
+            if (getDictStr(fbProps, "role") == "offer.next") {
+              curDisp = fbId;
+              ++armIdx;
+              continue;
+            }
+            const auto defTarget = blockEntry[fbId];
+            group.defaultTarget = defTarget;
+            verification::ProcessTransition defTr;
+            defTr.source = cursor;
+            defTr.target = defTarget;
+            defTr.kind = verification::BehavioralActionKind::Internal;
+            defTr.isOfferDefault = true;
+            defTr.progressMarkers = pendingMarkers;
+            aut.transitions.push_back(std::move(defTr));
+            break;
+          }
+          aut.states[cursor].offer = std::move(group);
+          continue;
+        }
+        if (isOfferCont) continue;
+
+        std::optional<std::string> fairTag;
+        bool justified = false;
+        if (StringRef(ctrl).starts_with("fair:")) {
+          fairTag = ctrl.substr(5);
+          if (cfgBlockById.contains(tSucc.getInt())) {
+            auto tProps =
+                cfgBlockById[tSucc.getInt()].getAs<DictionaryAttr>("properties");
+            justified = (getDictStr(tProps, "assumption_justified") == "true");
+          }
+          if (!justified) aut.unprovedFairnessAssumptions.insert(*fairTag);
+        }
+
+        verification::ProcessTransition trT;
+        trT.source = cursor;
+        trT.target = blockEntry[tSucc.getInt()];
+        trT.kind = verification::BehavioralActionKind::Internal;
+        trT.fairTag = fairTag;
+        trT.fairBranchOutcome = true;
+        trT.assumptionJustified = justified;
+        trT.progressMarkers = pendingMarkers;
+        aut.transitions.push_back(std::move(trT));
+
+        verification::ProcessTransition trF;
+        trF.source = cursor;
+        trF.target = blockEntry[fSucc.getInt()];
+        trF.kind = verification::BehavioralActionKind::Internal;
+        trF.fairTag = fairTag;
+        trF.fairBranchOutcome = false;
+        trF.assumptionJustified = justified;
+        trF.progressMarkers = std::move(pendingMarkers);
+        aut.transitions.push_back(std::move(trF));
+      }
+    }
+  }
+
+  return aut;
+}
+
+} // namespace
+
+LogicalResult verifyGPUPipelineProtocols(
+    ModuleOp module, const verification::GPUBoundedQueueOptions &options) {
+  std::map<std::string, verification::ProtocolAutomatonSpec> protocols;
+  for (ProtocolOp protoOp : module.getOps<ProtocolOp>()) {
+    verification::ProtocolAutomatonSpec pSpec;
+    pSpec.name = protoOp.getSymName().str();
+    pSpec.location = mlirLocToSourceLoc(protoOp.getLoc());
+    if (auto rolesArr =
+            protoOp.getSemanticProperties().getAs<ArrayAttr>("roles")) {
+      for (Attribute r : rolesArr) {
+        if (auto rs = dyn_cast<StringAttr>(r))
+          pSpec.roles.push_back(rs.getValue().str());
+      }
+    }
+    if (!protoOp.getBody().empty()) {
+      for (ProtocolStateOp stOp :
+           protoOp.getBody().front().getOps<ProtocolStateOp>()) {
+        verification::ProtocolStateSpec stSpec;
+        stSpec.name = stOp.getSymName().str();
+        stSpec.isFinal =
+            getDictStr(stOp.getSemanticProperties(), "final") == "true";
+        stSpec.location = mlirLocToSourceLoc(stOp.getLoc());
+        if (!stOp.getBody().empty()) {
+          for (MessageDeclOp msgOp :
+               stOp.getBody().front().getOps<MessageDeclOp>()) {
+            verification::ProtocolMessageSpec mSpec;
+            mSpec.name = msgOp.getSymName().str();
+            mSpec.senderRole =
+                getDictStr(msgOp.getSemanticProperties(), "sender");
+            mSpec.receiverRole =
+                getDictStr(msgOp.getSemanticProperties(), "receiver");
+            if (!msgOp.getRecords().empty()) {
+              if (auto rDict = dyn_cast<DictionaryAttr>(msgOp.getRecords()[0])) {
+                mSpec.successorState = getDictStr(
+                    rDict.getAs<DictionaryAttr>("properties"), "successor");
+              }
+            }
+            mSpec.location = mlirLocToSourceLoc(msgOp.getLoc());
+            stSpec.messages.push_back(std::move(mSpec));
+          }
+        }
+        pSpec.states.emplace(stSpec.name, std::move(stSpec));
+      }
+    }
+    protocols.emplace(pSpec.name, std::move(pSpec));
+  }
+
+  bool allValid = true;
+  for (PipelineOp pipeOp : module.getOps<PipelineOp>()) {
+    if (pipeOp.getBody().empty()) continue;
+    Block &pipeBody = pipeOp.getBody().front();
+    const std::string pipeName = pipeOp.getSymName().str();
+
+    SmallVector<EdgeOp> edges(pipeBody.getOps<EdgeOp>());
+    SmallVector<TopologyOp> topos(pipeBody.getOps<TopologyOp>());
+    SmallVector<ScheduleOp> scheds(pipeBody.getOps<ScheduleOp>());
+    SmallVector<StageOp> stages(pipeBody.getOps<StageOp>());
+
+    bool isGPUPipeline = false;
+    for (EdgeOp e : edges) {
+      const std::string storage = getDictStr(e.getSemanticProperties(), "storage");
+      const std::string scope = getDictStr(e.getSemanticProperties(), "scope");
+      if (StringRef(storage).starts_with("gpu::") || scope == "block" ||
+          scope == "warp" || scope == "device" || scope == "grid" ||
+          scope == "cluster") {
+        isGPUPipeline = true;
+      }
+    }
+    for (ScheduleOp s : scheds) {
+      const std::string tgt = getDictStr(s.getSemanticProperties(), "target");
+      if (StringRef(tgt).starts_with("sm") || StringRef(tgt).starts_with("gfx"))
+        isGPUPipeline = true;
+    }
+    for (StageOp st : stages) {
+      if (st.getExecutionDomain() == "Gpu") isGPUPipeline = true;
+    }
+    if (!isGPUPipeline) continue;
+
+    verification::GPUPipelineSystemSpec sys;
+    sys.name = pipeName;
+    sys.protocols = protocols;
+    sys.scheduleCount = scheds.size();
+    sys.location = mlirLocToSourceLoc(pipeOp.getLoc());
+
+    std::map<std::string, std::string> portRoleMap;
+    for (StageOp st : stages) {
+      const std::string qStage = pipeName + "::" + st.getSymName().str();
+      for (Attribute pAttr : st.getParameterAttrs()) {
+        auto pDict = dyn_cast<DictionaryAttr>(pAttr);
+        if (!pDict) continue;
+        const std::string pName = getDictStr(pDict, "name");
+        if (auto srcType = pDict.getAs<DictionaryAttr>("source_type")) {
+          const std::string tName = getDictStr(srcType, "name");
+          const auto sep = tName.rfind("::");
+          if (sep != std::string::npos)
+            portRoleMap[qStage + "." + pName] = tName.substr(sep + 2);
+        }
+      }
+    }
+
+    std::map<std::string, std::map<std::string, std::string>> stagePortMaps;
+    std::map<std::string, std::string> edgeProdStage, edgeConsStage;
+    std::map<std::string, std::string> edgeProdRole, edgeConsRole;
+
+    auto splitEp = [](const std::string &ep)
+        -> std::pair<std::string, std::string> {
+      const auto dot = ep.rfind('.');
+      if (dot == std::string::npos) return {ep, ""};
+      return {ep.substr(0, dot), ep.substr(dot + 1)};
+    };
+
+    for (TopologyOp topo : topos) {
+      for (Attribute rAttr : topo.getRecords()) {
+        auto rDict = dyn_cast<DictionaryAttr>(rAttr);
+        if (!rDict || getDictStr(rDict, "kind") != "connection") continue;
+        auto props = rDict.getAs<DictionaryAttr>("properties");
+        const std::string edgeName = getDictStr(props, "edge");
+        if (edgeName.empty()) continue;
+        const std::string srcFull = getDictStr(props, "source");
+        const std::string dstFull = getDictStr(props, "target");
+        const auto [srcSt, srcPort] = splitEp(srcFull);
+        const auto [dstSt, dstPort] = splitEp(dstFull);
+
+        if (!srcPort.empty()) stagePortMaps[srcSt][srcPort] = edgeName;
+        if (!dstPort.empty()) stagePortMaps[dstSt][dstPort] = edgeName;
+        const auto sep = edgeName.rfind("::");
+        if (sep != std::string::npos) {
+          const std::string shortEdge = edgeName.substr(sep + 2);
+          stagePortMaps[srcSt][shortEdge] = edgeName;
+          stagePortMaps[dstSt][shortEdge] = edgeName;
+        }
+        edgeProdStage[edgeName] = srcSt;
+        if (portRoleMap.contains(srcFull))
+          edgeProdRole[edgeName] = portRoleMap[srcFull];
+        if (edgeConsStage.contains(edgeName) &&
+            edgeConsStage[edgeName] != dstSt) {
+          sys.hasUnconnectedDuplicateConsumer = true;
+          sys.duplicateConsumerEdge = edgeName;
+          sys.duplicateConsumerLoc = mlirLocToSourceLoc(topo.getLoc());
+        } else {
+          edgeConsStage[edgeName] = dstSt;
+          if (portRoleMap.contains(dstFull))
+            edgeConsRole[edgeName] = portRoleMap[dstFull];
+        }
+      }
+    }
+
+    for (EdgeOp edgeOp : edges) {
+      verification::GPUBoundedQueueSpec q;
+      q.name = pipeName + "::" + edgeOp.getSymName().str();
+      q.location = mlirLocToSourceLoc(edgeOp.getLoc());
+      DictionaryAttr props = edgeOp.getSemanticProperties();
+      q.initialProtocolState = getDictStr(props, "initial");
+      q.capacity = parseAttrUnsigned(getDictStr(props, "capacity")).value_or(0);
+      const std::string seededStr = getDictStr(props, "seeded_items");
+      if (!seededStr.empty()) {
+        q.seededItems =
+            parseAttrUnsigned(seededStr).value_or(q.capacity + 1);
+      }
+      const std::string stg = getDictStr(props, "storage");
+      if (!stg.empty()) q.storage = stg;
+      const std::string scp = getDictStr(props, "scope");
+      if (!scp.empty()) q.scope = scp;
+      const std::string bp = getDictStr(props, "backpressure");
+      if (!bp.empty()) q.backpressure = bp;
+
+      for (Attribute rAttr : edgeOp.getRecords()) {
+        auto rDict = dyn_cast<DictionaryAttr>(rAttr);
+        if (rDict && getDictStr(rDict, "kind") == "channel_protocol")
+          q.protocolName = getDictStr(rDict, "name");
+      }
+
+      const bool wgLocal = (q.scope == "block" || q.scope == "warp");
+      q.residency = wgLocal
+                        ? verification::GPUResidencyContract::WorkgroupLocal
+                        : (options.profile.allowCooperativeGridChannels
+                               ? verification::GPUResidencyContract::CooperativeGrid
+                               : verification::GPUResidencyContract::UnscheduledGrid);
+      const std::string pubStr = getDictStr(props, "publication");
+      if (!pubStr.empty()) {
+        q.explicitPublication = true;
+        q.publication = parseMLIRPublication(pubStr).value_or(
+            verification::GPUPublicationOrder::Relaxed);
+      } else {
+        q.publication =
+            wgLocal ? verification::GPUPublicationOrder::AcqRelWorkgroup
+                    : verification::GPUPublicationOrder::AcqRelDevice;
+      }
+
+      if (edgeProdStage.contains(q.name)) q.producerStage = edgeProdStage[q.name];
+      if (edgeProdRole.contains(q.name)) q.producerRole = edgeProdRole[q.name];
+      if (edgeConsStage.contains(q.name)) q.consumerStage = edgeConsStage[q.name];
+      if (edgeConsRole.contains(q.name)) q.consumerRole = edgeConsRole[q.name];
+      sys.queues.push_back(std::move(q));
+    }
+
+    auto symRefToStageName = [&](Attribute refAttr) -> std::string {
+      SymbolRefAttr sym = dyn_cast<SymbolRefAttr>(refAttr);
+      if (!sym) {
+        if (auto dict = dyn_cast<DictionaryAttr>(refAttr))
+          sym = dict.getAs<SymbolRefAttr>("symbol");
+      }
+      if (!sym) return {};
+      if (!sym.getNestedReferences().empty()) {
+        return sym.getRootReference().str() + "::" +
+               sym.getNestedReferences().back().getValue().str();
+      }
+      return sym.getRootReference().str();
+    };
+
+    for (ScheduleOp sched : scheds) {
+      std::map<std::string, std::pair<std::size_t, std::string>> workerInfo;
+      for (Attribute rAttr : sched.getRecords()) {
+        auto rDict = dyn_cast<DictionaryAttr>(rAttr);
+        if (!rDict || getDictStr(rDict, "kind") != "fused_kernel") continue;
+        const std::string wName = getDictStr(rDict, "name");
+        auto props = rDict.getAs<DictionaryAttr>("properties");
+        const std::string blkStr = getDictStr(props, "blocks");
+        const std::size_t blks =
+            blkStr.empty() ? 1 : parseAttrUnsigned(blkStr).value_or(0);
+        const std::string resMode = getDictStr(props, "residency").empty()
+                                        ? "persistent"
+                                        : getDictStr(props, "residency");
+        workerInfo[wName] = {blks, resMode};
+        if (auto refsArr = rDict.getAs<ArrayAttr>("references")) {
+          for (Attribute sRef : refsArr) {
+            const std::string sName = symRefToStageName(sRef);
+            if (sName.empty()) continue;
+            verification::GPUStagePlacementInfo pInfo;
+            pInfo.stageName = sName;
+            pInfo.workerName = wName;
+            pInfo.workerBlocks = blks;
+            pInfo.workerResidency = resMode;
+            pInfo.location = mlirLocToSourceLoc(sched.getLoc());
+            sys.placements[sName] = std::move(pInfo);
+          }
+        }
+      }
+      for (Attribute rAttr : sched.getRecords()) {
+        auto rDict = dyn_cast<DictionaryAttr>(rAttr);
+        if (!rDict || getDictStr(rDict, "kind") != "placement") continue;
+        auto refsArr = rDict.getAs<ArrayAttr>("references");
+        if (!refsArr || refsArr.empty()) continue;
+        const std::string sName = symRefToStageName(refsArr[0]);
+        if (sName.empty()) continue;
+        auto &pInfo = sys.placements[sName];
+        pInfo.stageName = sName;
+        auto props = rDict.getAs<DictionaryAttr>("properties");
+        const std::string wName = getDictStr(props, "worker");
+        if (!wName.empty()) {
+          pInfo.workerName = wName;
+          if (workerInfo.contains(wName)) {
+            pInfo.workerBlocks = workerInfo[wName].first;
+            pInfo.workerResidency = workerInfo[wName].second;
+          }
+        }
+        pInfo.hasWarpPlacement = true;
+        pInfo.firstWarp =
+            parseAttrUnsigned(getDictStr(props, "index")).value_or(0);
+        const std::string endStr = getDictStr(props, "end");
+        pInfo.lastWarp = endStr.empty()
+                             ? pInfo.firstWarp
+                             : parseAttrUnsigned(endStr).value_or(pInfo.firstWarp);
+        pInfo.location = mlirLocToSourceLoc(sched.getLoc());
+      }
+    }
+
+    for (StageOp st : stages) {
+      const std::string qStage = pipeName + "::" + st.getSymName().str();
+      const auto mIt = stagePortMaps.find(qStage);
+      const std::map<std::string, std::string> emptyMap;
+      sys.stages.push_back(extractMLIRStageAutomaton(
+          st, qStage, mIt != stagePortMaps.end() ? mIt->second : emptyMap));
+    }
+
+    verification::GPUBoundedQueueReport rep;
+    verification::verifyGPUPipelineSystem(sys, options, rep);
+    for (const auto &v : rep.violations) {
+      pipeOp.emitError("[" + v.code + "] " + v.message);
+      allValid = false;
+    }
+    if (rep.status == verification::VerificationStatus::Unknown &&
+        rep.violations.empty()) {
+      pipeOp.emitError("[gpu.solver.unknown] bounded-queue verification indeterminate");
+      allValid = false;
+    }
+  }
+
+  return success(allValid);
 }
 
 } // namespace metreon

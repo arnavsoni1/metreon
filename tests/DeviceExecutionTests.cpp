@@ -162,7 +162,7 @@ int main(int argc, char **argv) {
       withAsync.kernelGraphs()[0].setBody(std::move(body));
       rejected(context,
                [&] { return mlir::success(mlir::succeeded(metreon::importDeviceExecution(withAsync, context))); },
-               "behavioral channel or async");
+               "unissued generation");
     }
     compile(graph(prefix + "kernel __metreon_bodies(@cx: device; n: index) { index i = gpu::global_id(@cx); }"), context);
     failures(source, context);

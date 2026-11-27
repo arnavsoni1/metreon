@@ -35,6 +35,132 @@
 
 using namespace mlir;
 namespace metreon {
+namespace {
+
+bool isGPURuntimeAdapterSymbol(StringRef name) {
+  return name.starts_with("__gpu_ring_") || name.starts_with("__gpu_async_");
+}
+
+LogicalResult specializeNVVMRingAndAsyncAdapters(ModuleOp mod) {
+  MLIRContext *ctx = mod.getContext();
+  Type i32Ty = IntegerType::get(ctx, 32);
+  Type f32Ty = Float32Type::get(ctx);
+
+  SmallVector<LLVM::CallOp> adapterCalls;
+  mod.walk([&](LLVM::CallOp call) {
+    if (auto callee = call.getCallee()) {
+      if (isGPURuntimeAdapterSymbol(*callee)) adapterCalls.push_back(call);
+    }
+  });
+
+  for (LLVM::CallOp call : adapterCalls) {
+    const StringRef name = *call.getCallee();
+    const Location loc = call.getLoc();
+    OperandRange args = call.getOperands();
+    OpBuilder b(call);
+
+    auto gepRank1 = [&](unsigned memrefStart, Value idxVal, Type elemTy) -> Value {
+      Value alignedPtr = args[memrefStart + 1];
+      Value offset = args[memrefStart + 2];
+      Value totalIdx = b.create<LLVM::AddOp>(loc, offset, idxVal);
+      return b.create<LLVM::GEPOp>(loc, alignedPtr.getType(), elemTy,
+                                   alignedPtr, ValueRange{totalIdx});
+    };
+
+    auto emitPTXAcqRelFence = [&](StringRef symName) {
+      const StringRef ptxFence = symName.contains("_dev")
+                                     ? StringRef("fence.acq_rel.gpu;")
+                                     : StringRef("fence.acq_rel.cta;");
+      b.create<LLVM::InlineAsmOp>(
+          loc, TypeRange{}, ValueRange{}, ptxFence, "~{memory}",
+          /*has_side_effects=*/true, /*is_align_stack=*/false,
+          LLVM::AsmDialectAttr{}, ArrayAttr{});
+    };
+
+    if (name.starts_with("__gpu_ring_load_acquire_")) {
+      if (args.size() != 6) return call.emitOpError("invalid ring acquire-load arity");
+      Value ptr = gepRank1(0, args[5], i32Ty);
+      Value zero = b.create<LLVM::ConstantOp>(loc, i32Ty, b.getI32IntegerAttr(0));
+      auto rmw = b.create<LLVM::AtomicRMWOp>(
+          loc, LLVM::AtomicBinOp::add, ptr, zero,
+          LLVM::AtomicOrdering::monotonic);
+      emitPTXAcqRelFence(name);
+      call.getResult().replaceAllUsesWith(rmw.getRes());
+      call.erase();
+    } else if (name.starts_with("__gpu_ring_load_relaxed_")) {
+      if (args.size() != 6) return call.emitOpError("invalid ring relaxed-load arity");
+      Value ptr = gepRank1(0, args[5], i32Ty);
+      Value zero = b.create<LLVM::ConstantOp>(loc, i32Ty, b.getI32IntegerAttr(0));
+      auto rmw = b.create<LLVM::AtomicRMWOp>(
+          loc, LLVM::AtomicBinOp::add, ptr, zero,
+          LLVM::AtomicOrdering::monotonic);
+      call.getResult().replaceAllUsesWith(rmw.getRes());
+      call.erase();
+    } else if (name.starts_with("__gpu_ring_store_release_")) {
+      if (args.size() != 7) return call.emitOpError("invalid ring release-store arity");
+      Value ptr = gepRank1(0, args[5], i32Ty);
+      emitPTXAcqRelFence(name);
+      (void)b.create<LLVM::AtomicRMWOp>(
+          loc, LLVM::AtomicBinOp::xchg, ptr, args[6],
+          LLVM::AtomicOrdering::monotonic);
+      call.erase();
+    } else if (name.starts_with("__gpu_ring_read_f32_")) {
+      if (args.size() != 6) return call.emitOpError("invalid ring f32-read arity");
+      Value ptr = gepRank1(0, args[5], f32Ty);
+      auto ld = b.create<LLVM::LoadOp>(loc, f32Ty, ptr, /*alignment=*/4);
+      call.getResult().replaceAllUsesWith(ld.getRes());
+      call.erase();
+    } else if (name.starts_with("__gpu_ring_write_f32_")) {
+      if (args.size() != 7) return call.emitOpError("invalid ring f32-write arity");
+      Value ptr = gepRank1(0, args[5], f32Ty);
+      b.create<LLVM::StoreOp>(loc, args[6], ptr, /*alignment=*/4);
+      call.erase();
+    } else if (name.starts_with("__gpu_ring_read_i32_")) {
+      if (args.size() != 6) return call.emitOpError("invalid ring i32-read arity");
+      Value ptr = gepRank1(0, args[5], i32Ty);
+      auto ld = b.create<LLVM::LoadOp>(loc, i32Ty, ptr, /*alignment=*/4);
+      call.getResult().replaceAllUsesWith(ld.getRes());
+      call.erase();
+    } else if (name.starts_with("__gpu_ring_write_i32_")) {
+      if (args.size() != 7) return call.emitOpError("invalid ring i32-write arity");
+      Value ptr = gepRank1(0, args[5], i32Ty);
+      b.create<LLVM::StoreOp>(loc, args[6], ptr, /*alignment=*/4);
+      call.erase();
+    } else if (name.starts_with("__gpu_async_copy_elem_g2s_f32")) {
+      if (args.size() != 11) return call.emitOpError("invalid async g2s copy arity");
+      Value dstPtr = gepRank1(0, args[10], f32Ty);
+      Value srcPtr = gepRank1(5, args[10], f32Ty);
+      b.create<NVVM::CpAsyncOp>(loc, dstPtr, srcPtr, /*size=*/4u,
+                                NVVM::LoadCacheModifierKind::CA, Value{});
+      call.erase();
+    } else if (name.starts_with("__gpu_async_copy_elem_g2g_f32")) {
+      if (args.size() != 11) return call.emitOpError("invalid async g2g copy arity");
+      Value dstPtr = gepRank1(0, args[10], f32Ty);
+      Value srcPtr = gepRank1(5, args[10], f32Ty);
+      auto val = b.create<LLVM::LoadOp>(loc, f32Ty, srcPtr, /*alignment=*/4);
+      b.create<LLVM::StoreOp>(loc, val.getRes(), dstPtr, /*alignment=*/4);
+      call.erase();
+    } else if (name == "__gpu_async_commit_group") {
+      b.create<NVVM::CpAsyncCommitGroupOp>(loc);
+      call.erase();
+    } else if (name == "__gpu_async_wait_group") {
+      b.create<NVVM::CpAsyncWaitGroupOp>(loc, /*n=*/0u);
+      call.erase();
+    } else {
+      return call.emitOpError("unknown GPU runtime adapter symbol: ") << name;
+    }
+  }
+
+  SmallVector<LLVM::LLVMFuncOp> adapterDecls;
+  mod.walk([&](LLVM::LLVMFuncOp fn) {
+    if (isGPURuntimeAdapterSymbol(fn.getName())) adapterDecls.push_back(fn);
+  });
+  for (LLVM::LLVMFuncOp fn : adapterDecls) fn.erase();
+  return success();
+}
+
+} // namespace
+
 FailureOr<OwningOpRef<ModuleOp>> lowerDeviceToNVVM(ModuleOp module) {
   auto *context = module.getContext();
   context->getOrLoadDialect<LLVM::LLVMDialect>();
@@ -73,6 +199,7 @@ FailureOr<OwningOpRef<ModuleOp>> lowerDeviceToNVVM(ModuleOp module) {
   }
   if (modules != 1) { module.emitError("NVVM execution requires exactly one device module"); return failure(); }
   output->walk([](LLVM::LLVMFuncOp function) { function->removeAttr("gpu.kernel"); });
+  if (failed(specializeNVVMRingAndAsyncAdapters(*output))) return failure();
   OpBuilder builder(context);
   (*output)->setAttr("llvm.target_triple", builder.getStringAttr("nvptx64-nvidia-cuda"));
   if (failed(verify(*output))) return failure();

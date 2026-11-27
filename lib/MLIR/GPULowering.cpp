@@ -38,6 +38,12 @@ struct GPULoweringIntrinsicConversion : OpConversionPattern<DeviceIntrinsicOp> {
       auto thread = rewriter.create<gpu::ThreadIdOp>(op.getLoc(), gpu::Dimension::x);
       auto offset = rewriter.create<arith::MulIOp>(op.getLoc(), block, width);
       rewriter.replaceOpWithNewOp<arith::AddIOp>(op, offset, thread);
+    } else if (op.getKind() == "thread_id") {
+      rewriter.replaceOpWithNewOp<gpu::ThreadIdOp>(op, gpu::Dimension::x);
+    } else if (op.getKind() == "block_id") {
+      rewriter.replaceOpWithNewOp<gpu::BlockIdOp>(op, gpu::Dimension::x);
+    } else if (op.getKind() == "block_dim") {
+      rewriter.replaceOpWithNewOp<gpu::BlockDimOp>(op, gpu::Dimension::x);
     } else if (op.getKind() == "load") {
       rewriter.replaceOpWithNewOp<memref::LoadOp>(op, args[0], ValueRange{args[1]});
     } else if (op.getKind() == "store") {
@@ -45,6 +51,11 @@ struct GPULoweringIntrinsicConversion : OpConversionPattern<DeviceIntrinsicOp> {
       rewriter.eraseOp(op);
     } else if (op.getKind() == "barrier") {
       rewriter.replaceOpWithNewOp<gpu::BarrierOp>(op);
+    } else if (op.getKind() == "warp_barrier") {
+      auto zero = rewriter.create<arith::ConstantIntOp>(op.getLoc(), 0, 32);
+      rewriter.create<gpu::SubgroupReduceOp>(
+          op.getLoc(), zero, gpu::AllReduceOperation::ADD, /*uniform=*/true);
+      rewriter.eraseOp(op);
     } else {
       return rewriter.notifyMatchFailure(op, "unsupported device intrinsic in GPU control-flow lowering");
     }
@@ -257,6 +268,8 @@ public:
         }
       });
       if (!complete || failed(verify(*output))) return failure();
+      if (failed(verifyGPUBarrierUniformityAndAccessProtocols(*output)))
+        return failure();
       return std::move(output);
     } catch (const std::exception &error) {
       emitError(location(current)) << "GraphIR GPU control-flow lowering: " << error.what();

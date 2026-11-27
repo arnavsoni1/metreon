@@ -9,6 +9,10 @@ namespace metreon {
 // nominal context/grant checks and compiler/ABI well-formedness are performed.
 ::mlir::FailureOr<::mlir::OwningOpRef<::mlir::ModuleOp>>
 importDeviceExecution(const graphir::Module &source, ::mlir::MLIRContext &context);
+// Imports a GraphIR module containing GPU protocols/pipelines into a verified
+// Metreon MLIR module ready for `lowerMetreonDeviceToGPU`.
+::mlir::FailureOr<::mlir::OwningOpRef<::mlir::ModuleOp>>
+importGPUPipelineExecution(const graphir::Module &source, ::mlir::MLIRContext &context);
 ::mlir::LogicalResult verifyDeviceContexts(::mlir::ModuleOp module);
 ::mlir::LogicalResult lowerMetreonDeviceToGPU(::mlir::ModuleOp module);
 ::mlir::FailureOr<::mlir::OwningOpRef<::mlir::ModuleOp>> lowerDeviceToNVVM(::mlir::ModuleOp module);

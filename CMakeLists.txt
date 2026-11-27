@@ -99,6 +99,8 @@ add_library(metreon_frontend
     lib/Sema/CompositionValidator.cpp
     lib/Verification/GPUProfile.cpp
     lib/Verification/GPUOwnershipAndLoans.cpp
+    lib/Verification/GPUMemoryAccessProtocol.cpp
+    lib/Verification/Behavioral.cpp
 )
 
 target_include_directories(metreon_frontend
@@ -235,6 +237,21 @@ if(BUILD_TESTING)
         metreon_enable_warnings(metreon_gpu_mlir_verification_tests)
         add_test(NAME metreon.gpu.mlir_verification COMMAND metreon_gpu_mlir_verification_tests
             ${CMAKE_CURRENT_SOURCE_DIR}/examples/vector_add.mtr)
+        add_executable(metreon_gpu_simt_drf_mlir_tests tests/GPUSIMTAndDRFMLIRTests.cpp)
+        target_link_libraries(metreon_gpu_simt_drf_mlir_tests PRIVATE metreon_aot MLIRParser)
+        metreon_enable_warnings(metreon_gpu_simt_drf_mlir_tests)
+        add_test(NAME metreon.gpu.mlir_simt_drf COMMAND metreon_gpu_simt_drf_mlir_tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/examples/vector_add.mtr)
+        add_executable(metreon_gpu_pipeline_protocol_mlir_tests tests/GPUPipelineProtocolMLIRTests.cpp)
+        target_link_libraries(metreon_gpu_pipeline_protocol_mlir_tests PRIVATE metreon_aot MLIRParser)
+        metreon_enable_warnings(metreon_gpu_pipeline_protocol_mlir_tests)
+        add_test(NAME metreon.gpu.mlir_pipeline_protocols COMMAND metreon_gpu_pipeline_protocol_mlir_tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/examples/protocols_and_pipelines.mtr)
+        add_executable(metreon_gpu_ring_buffer_async_codegen_tests tests/GPURingBufferAndAsyncCodegenTests.cpp)
+        target_link_libraries(metreon_gpu_ring_buffer_async_codegen_tests PRIVATE metreon_aot MLIRParser)
+        metreon_enable_warnings(metreon_gpu_ring_buffer_async_codegen_tests)
+        add_test(NAME metreon.gpu.ring_buffer_async_codegen COMMAND metreon_gpu_ring_buffer_async_codegen_tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/examples/protocols_and_pipelines.mtr)
         add_executable(metreon_host_lowering_tests tests/HostLoweringTests.cpp)
         target_link_libraries(metreon_host_lowering_tests PRIVATE metreon_host_lowering MLIRParser)
         metreon_enable_warnings(metreon_host_lowering_tests)
@@ -336,6 +353,24 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/examples/vector_add.mtr
             ${CMAKE_CURRENT_SOURCE_DIR}/examples/procedures.mtr
             ${CMAKE_CURRENT_SOURCE_DIR}/examples/contexts.mtr)
+
+    add_executable(metreon_gpu_access_protocol_tests
+        tests/GPUMemoryAccessProtocolTests.cpp)
+    target_link_libraries(metreon_gpu_access_protocol_tests
+        PRIVATE metreon_frontend)
+    metreon_enable_warnings(metreon_gpu_access_protocol_tests)
+    add_test(NAME metreon.gpu.access_protocol
+        COMMAND metreon_gpu_access_protocol_tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/examples/vector_add.mtr)
+
+    add_executable(metreon_gpu_bounded_queue_tests
+        tests/GPUBoundedQueueTests.cpp)
+    target_link_libraries(metreon_gpu_bounded_queue_tests
+        PRIVATE metreon_frontend)
+    metreon_enable_warnings(metreon_gpu_bounded_queue_tests)
+    add_test(NAME metreon.gpu.bounded_queues
+        COMMAND metreon_gpu_bounded_queue_tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/examples/protocols_and_pipelines.mtr)
 
     if(NOT METREON_ENABLE_MLIR)
         find_program(METREON_STANDALONE_TABLEGEN

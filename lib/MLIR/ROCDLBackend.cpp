@@ -39,6 +39,123 @@
 
 using namespace mlir;
 namespace metreon {
+namespace {
+
+bool isGPURuntimeAdapterSymbol(StringRef name) {
+  return name.starts_with("__gpu_ring_") || name.starts_with("__gpu_async_");
+}
+
+StringRef rocdlRingSyncScope(StringRef symbolName) {
+  return symbolName.contains("_dev") ? StringRef("agent")
+                                     : StringRef("workgroup");
+}
+
+LogicalResult specializeROCDLRingAndAsyncAdapters(ModuleOp mod) {
+  MLIRContext *ctx = mod.getContext();
+  Type i32Ty = IntegerType::get(ctx, 32);
+  Type f32Ty = Float32Type::get(ctx);
+
+  SmallVector<LLVM::CallOp> adapterCalls;
+  mod.walk([&](LLVM::CallOp call) {
+    if (auto callee = call.getCallee()) {
+      if (isGPURuntimeAdapterSymbol(*callee)) adapterCalls.push_back(call);
+    }
+  });
+
+  for (LLVM::CallOp call : adapterCalls) {
+    const StringRef name = *call.getCallee();
+    const Location loc = call.getLoc();
+    OperandRange args = call.getOperands();
+    OpBuilder b(call);
+
+    auto gepRank1 = [&](unsigned memrefStart, Value idxVal, Type elemTy) -> Value {
+      Value alignedPtr = args[memrefStart + 1];
+      Value offset = args[memrefStart + 2];
+      Value totalIdx = b.create<LLVM::AddOp>(loc, offset, idxVal);
+      return b.create<LLVM::GEPOp>(loc, alignedPtr.getType(), elemTy,
+                                   alignedPtr, ValueRange{totalIdx});
+    };
+
+    if (name.starts_with("__gpu_ring_load_acquire_")) {
+      if (args.size() != 6) return call.emitOpError("invalid ring acquire-load arity");
+      Value ptr = gepRank1(0, args[5], i32Ty);
+      const StringRef scope = rocdlRingSyncScope(name);
+      Value zero = b.create<LLVM::ConstantOp>(loc, i32Ty, b.getI32IntegerAttr(0));
+      auto rmw = b.create<LLVM::AtomicRMWOp>(
+          loc, LLVM::AtomicBinOp::add, ptr, zero,
+          LLVM::AtomicOrdering::monotonic, scope);
+      b.create<LLVM::FenceOp>(loc, LLVM::AtomicOrdering::acquire, scope);
+      call.getResult().replaceAllUsesWith(rmw.getRes());
+      call.erase();
+    } else if (name.starts_with("__gpu_ring_load_relaxed_")) {
+      if (args.size() != 6) return call.emitOpError("invalid ring relaxed-load arity");
+      Value ptr = gepRank1(0, args[5], i32Ty);
+      Value zero = b.create<LLVM::ConstantOp>(loc, i32Ty, b.getI32IntegerAttr(0));
+      auto rmw = b.create<LLVM::AtomicRMWOp>(
+          loc, LLVM::AtomicBinOp::add, ptr, zero,
+          LLVM::AtomicOrdering::monotonic, rocdlRingSyncScope(name));
+      call.getResult().replaceAllUsesWith(rmw.getRes());
+      call.erase();
+    } else if (name.starts_with("__gpu_ring_store_release_")) {
+      if (args.size() != 7) return call.emitOpError("invalid ring release-store arity");
+      Value ptr = gepRank1(0, args[5], i32Ty);
+      const StringRef scope = rocdlRingSyncScope(name);
+      b.create<LLVM::FenceOp>(loc, LLVM::AtomicOrdering::release, scope);
+      (void)b.create<LLVM::AtomicRMWOp>(
+          loc, LLVM::AtomicBinOp::xchg, ptr, args[6],
+          LLVM::AtomicOrdering::monotonic, scope);
+      call.erase();
+    } else if (name.starts_with("__gpu_ring_read_f32_")) {
+      if (args.size() != 6) return call.emitOpError("invalid ring f32-read arity");
+      Value ptr = gepRank1(0, args[5], f32Ty);
+      auto ld = b.create<LLVM::LoadOp>(loc, f32Ty, ptr, /*alignment=*/4);
+      call.getResult().replaceAllUsesWith(ld.getRes());
+      call.erase();
+    } else if (name.starts_with("__gpu_ring_write_f32_")) {
+      if (args.size() != 7) return call.emitOpError("invalid ring f32-write arity");
+      Value ptr = gepRank1(0, args[5], f32Ty);
+      b.create<LLVM::StoreOp>(loc, args[6], ptr, /*alignment=*/4);
+      call.erase();
+    } else if (name.starts_with("__gpu_ring_read_i32_")) {
+      if (args.size() != 6) return call.emitOpError("invalid ring i32-read arity");
+      Value ptr = gepRank1(0, args[5], i32Ty);
+      auto ld = b.create<LLVM::LoadOp>(loc, i32Ty, ptr, /*alignment=*/4);
+      call.getResult().replaceAllUsesWith(ld.getRes());
+      call.erase();
+    } else if (name.starts_with("__gpu_ring_write_i32_")) {
+      if (args.size() != 7) return call.emitOpError("invalid ring i32-write arity");
+      Value ptr = gepRank1(0, args[5], i32Ty);
+      b.create<LLVM::StoreOp>(loc, args[6], ptr, /*alignment=*/4);
+      call.erase();
+    } else if (name.starts_with("__gpu_async_copy_elem_g2s_f32") ||
+               name.starts_with("__gpu_async_copy_elem_g2g_f32")) {
+      if (args.size() != 11) return call.emitOpError("invalid async copy arity");
+      Value dstPtr = gepRank1(0, args[10], f32Ty);
+      Value srcPtr = gepRank1(5, args[10], f32Ty);
+      auto val = b.create<LLVM::LoadOp>(loc, f32Ty, srcPtr, /*alignment=*/4);
+      b.create<LLVM::StoreOp>(loc, val.getRes(), dstPtr, /*alignment=*/4);
+      call.erase();
+    } else if (name == "__gpu_async_commit_group") {
+      b.create<LLVM::FenceOp>(loc, LLVM::AtomicOrdering::release, "workgroup");
+      call.erase();
+    } else if (name == "__gpu_async_wait_group") {
+      b.create<LLVM::FenceOp>(loc, LLVM::AtomicOrdering::acquire, "workgroup");
+      call.erase();
+    } else {
+      return call.emitOpError("unknown GPU runtime adapter symbol: ") << name;
+    }
+  }
+
+  SmallVector<LLVM::LLVMFuncOp> adapterDecls;
+  mod.walk([&](LLVM::LLVMFuncOp fn) {
+    if (isGPURuntimeAdapterSymbol(fn.getName())) adapterDecls.push_back(fn);
+  });
+  for (LLVM::LLVMFuncOp fn : adapterDecls) fn.erase();
+  return success();
+}
+
+} // namespace
+
 FailureOr<OwningOpRef<ModuleOp>> lowerDeviceToROCDL(ModuleOp module) {
   auto *context = module.getContext();
   context->getOrLoadDialect<LLVM::LLVMDialect>();
@@ -69,8 +186,10 @@ FailureOr<OwningOpRef<ModuleOp>> lowerDeviceToROCDL(ModuleOp module) {
   options.dataLayout = layout->createDataLayout();
   working->walk([&](memref::AllocaOp local) {
     auto type = local.getType();
-    local.getResult().setType(MemRefType::get(type.getShape(), type.getElementType(), type.getLayout(),
-        IntegerAttr::get(IntegerType::get(context, 64), 5)));
+    if (!type.getMemorySpace()) {
+      local.getResult().setType(MemRefType::get(type.getShape(), type.getElementType(), type.getLayout(),
+          IntegerAttr::get(IntegerType::get(context, 64), 5)));
+    }
   });
   options.overrideIndexBitwidth(64);
   LLVMTypeConverter converter(context, options);
@@ -113,6 +232,7 @@ FailureOr<OwningOpRef<ModuleOp>> lowerDeviceToROCDL(ModuleOp module) {
     if (function->hasAttr("rocdl.kernel"))
       function->setAttr("rocdl.flat_work_group_size", StringAttr::get(context, "1,1024"));
   });
+  if (failed(specializeROCDLRingAndAsyncAdapters(*output))) return failure();
   (*output)->setAttr("llvm.target_triple", StringAttr::get(context, "amdgcn-amd-amdhsa"));
   if (failed(verify(*output))) return failure();
   return output;

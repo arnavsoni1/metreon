@@ -313,9 +313,10 @@ METREON_CALLABLE_VERIFY(StageOp)
 
 LogicalResult DeviceIntrinsicOp::verify() {
   const auto kind = getKind();
-  if (kind == "global_id") {
+  if (kind == "global_id" || kind == "thread_id" || kind == "block_id" ||
+      kind == "block_dim") {
     if (getNumOperands() || getNumResults() != 1 || !getResult(0).getType().isIndex())
-      return emitOpError("global_id requires no runtime operands and one index result");
+      return emitOpError("index query intrinsic requires no runtime operands and one index result");
     return success();
   }
   if (kind == "barrier" || kind == "warp_barrier" || kind == "grid_barrier") {

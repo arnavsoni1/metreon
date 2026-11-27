@@ -264,6 +264,14 @@ public:
 };
 } // namespace
 
+std::string assembleCUDACodeObject(const std::string &ptx, const std::string &architecture) {
+  WorkDirectory work(fs::temp_directory_path());
+  write(work.path / "device.ptx", ptx);
+  execute(toolchain::ptxas, {"-arch=" + architecture, "-O0", "-o", (work.path / "device.cubin").string(),
+      (work.path / "device.ptx").string()}, work.path);
+  return read(work.path / "device.cubin");
+}
+
 std::string linkAMDGPUCodeObject(const std::string &object) {
   WorkDirectory work(fs::temp_directory_path());
   write(work.path / "device.o", object);
@@ -286,8 +294,10 @@ void emitExecutable(const graphir::Module &source, const AOTOptions &options) {
     throw std::runtime_error("executable requires a host procedure main() -> i32 with no runtime parameters");
   WorkDirectory work(destination.parent_path());
   std::string deviceImage;
-  if (!source.kernelGraphs().empty()) {
-    auto device = importDeviceExecution(source, context);
+  if (!source.kernelGraphs().empty() || !source.pipelineGraphs().empty()) {
+    auto device = !source.pipelineGraphs().empty()
+                      ? importGPUPipelineExecution(source, context)
+                      : importDeviceExecution(source, context);
     if (mlir::failed(device) || mlir::failed(lowerMetreonDeviceToGPU(**device))) throw std::runtime_error("device executable lowering failed");
     if (options.backend == GPUBackend::AMDGPU) {
       auto rocdl = lowerDeviceToROCDL(**device);

@@ -48,6 +48,8 @@ class ScalarCFGBuilder {
       fail("scalar lowering does not erase ownership/resource obligations");
     if ((deviceExecution || hostExecution) && text == "gpu::span<f32>")
       return MemRefType::get({ShapedType::kDynamic}, builder.getF32Type(), MemRefLayoutAttrInterface{}, builder.getI64IntegerAttr(1));
+    if (deviceExecution && text == "gpu::shared_span<f32>")
+      return MemRefType::get({ShapedType::kDynamic}, builder.getF32Type(), MemRefLayoutAttrInterface{}, builder.getI64IntegerAttr(3));
     if (hostExecution && text == "host::span<f32>")
       return MemRefType::get({ShapedType::kDynamic}, builder.getF32Type());
     if (name == "view" || name == "buffer")
@@ -387,6 +389,29 @@ class ScalarCFGBuilder {
           if ((deviceExecution || hostExecution) && callContext)
             call->setAttr("metreon.context", FlatSymbolRefAttr::get(&context, callContext->identifier()));
           if (call.getNumResults()) result = call.getResult(0);
+          break;
+        }
+        case graphir::CallableOperationKind::AsyncIssue: {
+          if (!deviceExecution) fail("scalar CFG async_issue requires device execution lowering");
+          const auto inherited = inheritedContexts.at(id);
+          if (!inherited || !inherited->hasIdentifier()) fail("device async_issue has no declared nominal context");
+          if (op.operands.size() != 2) fail("device async_issue requires source and destination buffer operands");
+          builder.create<AsyncCopyOp>(
+              loc, builder.getStringAttr(required(op.attributes, "slot")),
+              builder.getStringAttr(required(op.attributes, "generation")),
+              FlatSymbolRefAttr::get(&context, inherited->identifier()),
+              operand(0), operand(1));
+          break;
+        }
+        case graphir::CallableOperationKind::AsyncWait: {
+          if (!deviceExecution) fail("scalar CFG async_wait requires device execution lowering");
+          const auto inherited = inheritedContexts.at(id);
+          if (!inherited || !inherited->hasIdentifier()) fail("device async_wait has no declared nominal context");
+          if (!op.operands.empty()) fail("device async_wait takes no runtime buffer operands");
+          builder.create<AsyncWaitOp>(
+              loc, builder.getStringAttr(required(op.attributes, "slot")),
+              builder.getStringAttr(required(op.attributes, "generation")),
+              FlatSymbolRefAttr::get(&context, inherited->identifier()));
           break;
         }
         default: fail("unsupported executable GraphIR operation in scalar CFG");

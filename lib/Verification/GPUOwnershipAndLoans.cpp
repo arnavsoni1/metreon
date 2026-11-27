@@ -1407,7 +1407,9 @@ bool isIntrinsicAllowedInScope(GPUExecutionScope scope,
   if (trimmed == "gpu::warp_barrier" || trimmed == "warp_barrier" ||
       trimmed == "gpu::warp_shuffle" || trimmed == "warp_shuffle" ||
       trimmed == "gpu::warp_vote" || trimmed == "warp_vote") {
-    return scope == GPUExecutionScope::Subgroup;
+    return scope == GPUExecutionScope::Subgroup ||
+           scope == GPUExecutionScope::Workgroup ||
+           scope == GPUExecutionScope::DeviceGrid;
   }
   return true;
 }
